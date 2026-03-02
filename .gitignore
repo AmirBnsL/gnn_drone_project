@@ -1,0 +1,22 @@
+# Ignore everything
+/*
+
+# Except these folders/files
+!/data-collection/
+!/datasets/
+!/gnn/
+!/data_collection.md
+!/.gitignore
+
+# Ignore files inside datasets, but keep the folder if there's a .gitkeep or similar
+/datasets/*
+!/datasets/.gitkeep
+!/gnn/.gitkeep
+
+/docs/
+/examples/
+/docs_source/
+/tests/
+/PyFlyt/
+/readme_assets/
+readme.md
