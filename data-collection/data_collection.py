@@ -357,8 +357,11 @@ def generate_dataset(
         Writes a compressed ``.npz`` dataset to disk containing states, targets,
         labels, edges, and formation metadata.
     """
-    os.makedirs("datasets", exist_ok=True)
-    dataset_path = f"../datasets/{dataset_name}_{dataset_type}.npz"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+    datasets_dir = os.path.join(repo_root, "datasets")
+    os.makedirs(datasets_dir, exist_ok=True)
+    dataset_path = os.path.join(datasets_dir, f"{dataset_name}_{dataset_type}.npz")
 
     all_states = []
     all_targets = []
