@@ -13,6 +13,10 @@
 !/datasets/.gitkeep
 !/gnn/.gitkeep
 
+# Ignore generated datasets in data-collection
+/data-collection/datasets/*
+!/data-collection/datasets/.gitkeep
+
 /docs/
 /examples/
 /docs_source/
