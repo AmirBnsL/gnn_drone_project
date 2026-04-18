@@ -8,6 +8,7 @@
 !/data_collection.md
 !/visualization 
 !/.gitignore
+!/residual_correction/
 
 # Ignore files inside datasets, but keep the folder if there's a .gitkeep or similar
 /datasets/*

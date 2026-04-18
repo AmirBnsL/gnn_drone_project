@@ -1,0 +1,28 @@
+Current comparison with your new normalized weighting
+Zero baseline
+Val: 1.0461
+Test: 0.9527
+MLP
+Best epoch: 1
+Best val: 1.0557
+Test: 0.9935
+GAT
+Best epoch: 9
+Best val: 1.1235
+Test: 1.0445
+  using this 
+def compute_loss(pred, target):
+    mag = torch.norm(target, dim=1)
+
+    # normalize magnitude to avoid extreme weights
+    mag = mag / (mag.mean() + 1e-6)
+
+    weights = 1.0 + mag  # softer scaling
+
+    mse = (pred - target) ** 2
+    mse = mse.mean(dim=1)
+
+    return (weights * mse).mean()
+
+if MODEL_NAME != "zero":
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
