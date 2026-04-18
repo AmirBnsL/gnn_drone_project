@@ -1,10 +1,12 @@
 import argparse
+import itertools
 import json
 import math
 import time
 from pathlib import Path
 
 import numpy as np
+import pybullet as p
 import torch
 import torch.nn as nn
 from PyFlyt.core.aviary import Aviary
@@ -73,6 +75,279 @@ def wrap_angle(angle):
     """Wrap angle to [-pi, pi]."""
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
+
+def formation_a_offsets(num_drones: int, spacing: float = 2.0) -> np.ndarray:
+    offsets = np.zeros((num_drones, 3), dtype=np.float32)
+    if num_drones <= 1:
+        return offsets
+
+    num_crossbar = (num_drones // 5) if num_drones > 5 else 0
+    num_v_legs = num_drones - num_crossbar
+
+    if num_v_legs % 2 == 0:
+        num_crossbar += 1
+        num_v_legs -= 1
+
+    offsets[0] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    for idx in range(1, num_v_legs):
+        level = (idx + 1) // 2
+        side = -1.0 if idx % 2 == 1 else 1.0
+        offsets[idx, 0] = side * level * spacing
+        offsets[idx, 1] = level * spacing
+
+    if num_crossbar > 0:
+        max_level = (num_v_legs + 1) // 2
+        mid_level = max(1, max_level // 2)
+
+        left_x = -mid_level * spacing
+        right_x = mid_level * spacing
+        width = right_x - left_x
+
+        for crossbar_idx in range(num_crossbar):
+            fraction = (crossbar_idx + 1) / (num_crossbar + 1)
+            target_idx = num_v_legs + crossbar_idx
+            offsets[target_idx, 0] = left_x + (fraction * width)
+            offsets[target_idx, 1] = mid_level * spacing
+
+    offsets[:, :2] -= np.mean(offsets[:, :2], axis=0)
+    return offsets
+
+
+def formation_rectangle_offsets(num_drones: int, spacing: float = 2.0) -> np.ndarray:
+    offsets = np.zeros((num_drones, 3), dtype=np.float32)
+    if num_drones == 0:
+        return offsets
+
+    perimeter = num_drones * spacing
+    side = perimeter / 4.0
+
+    corners = [
+        np.array([-side / 2.0, -side / 2.0], dtype=np.float32),
+        np.array([ side / 2.0, -side / 2.0], dtype=np.float32),
+        np.array([ side / 2.0,  side / 2.0], dtype=np.float32),
+        np.array([-side / 2.0,  side / 2.0], dtype=np.float32),
+    ]
+
+    for i in range(min(num_drones, 4)):
+        offsets[i, :2] = corners[i]
+
+    if num_drones > 4:
+        remaining = num_drones - 4
+        drones_per_edge = [remaining // 4 + (1 if e < remaining % 4 else 0) for e in range(4)]
+
+        current_idx = 4
+        for e in range(4):
+            start_c = corners[e]
+            end_c = corners[(e + 1) % 4]
+            num_edge = drones_per_edge[e]
+
+            for step in range(1, num_edge + 1):
+                fraction = step / (num_edge + 1)
+                offsets[current_idx, :2] = start_c + fraction * (end_c - start_c)
+                current_idx += 1
+
+    offsets[:, :2] -= np.mean(offsets[:, :2], axis=0)
+    return offsets
+
+
+def formation_triangle_offsets(num_drones: int, spacing: float = 2.0) -> np.ndarray:
+    offsets = np.zeros((num_drones, 3), dtype=np.float32)
+    if num_drones == 0:
+        return offsets
+
+    perimeter = num_drones * spacing
+    side = perimeter / 3.0
+    height = side * np.sqrt(3) / 2.0
+
+    corners = [
+        np.array([-side / 2.0, -height / 3.0], dtype=np.float32),
+        np.array([ side / 2.0, -height / 3.0], dtype=np.float32),
+        np.array([ 0.0,         2.0 * height / 3.0], dtype=np.float32),
+    ]
+
+    for i in range(min(num_drones, 3)):
+        offsets[i, :2] = corners[i]
+
+    if num_drones > 3:
+        remaining = num_drones - 3
+        drones_per_edge = [remaining // 3 + (1 if e < remaining % 3 else 0) for e in range(3)]
+
+        current_idx = 3
+        for e in range(3):
+            start_c = corners[e]
+            end_c = corners[(e + 1) % 3]
+            num_edge = drones_per_edge[e]
+
+            for step in range(1, num_edge + 1):
+                fraction = step / (num_edge + 1)
+                offsets[current_idx, :2] = start_c + fraction * (end_c - start_c)
+                current_idx += 1
+
+    offsets[:, :2] -= np.mean(offsets[:, :2], axis=0)
+    return offsets
+
+
+def formation_w_offsets(num_drones: int, spacing: float = 2.0) -> np.ndarray:
+    offsets = np.zeros((num_drones, 3), dtype=np.float32)
+    if num_drones == 0:
+        return offsets
+
+    points = np.array(
+        [
+            [-2.0,  2.0],
+            [-1.0,  0.0],
+            [ 0.0,  2.0],
+            [ 1.0,  0.0],
+            [ 2.0,  2.0],
+        ],
+        dtype=np.float32,
+    ) * spacing
+
+    segs = points[1:] - points[:-1]
+    seg_len = np.linalg.norm(segs, axis=1)
+    total = float(np.sum(seg_len))
+    if total <= 1e-6:
+        return offsets
+
+    distances = np.linspace(0.0, total, num_drones, dtype=np.float32)
+    acc = 0.0
+    seg_idx = 0
+
+    for i, d in enumerate(distances):
+        while seg_idx < len(seg_len) - 1 and d > acc + seg_len[seg_idx]:
+            acc += seg_len[seg_idx]
+            seg_idx += 1
+        t = 0.0 if seg_len[seg_idx] < 1e-6 else (d - acc) / seg_len[seg_idx]
+        offsets[i, :2] = points[seg_idx] + t * segs[seg_idx]
+
+    offsets[:, :2] -= np.mean(offsets[:, :2], axis=0)
+    return offsets
+
+
+def build_formation_positions(
+    formation_name: str,
+    num_drones: int,
+    center_xy: np.ndarray,
+    altitude: float,
+    spacing: float = 2.0,
+) -> np.ndarray:
+    if formation_name == "a":
+        offsets = formation_a_offsets(num_drones, spacing)
+    elif formation_name == "rectangle":
+        offsets = formation_rectangle_offsets(num_drones, spacing)
+    elif formation_name == "triangle":
+        offsets = formation_triangle_offsets(num_drones, spacing)
+    elif formation_name == "w":
+        offsets = formation_w_offsets(num_drones, spacing)
+    else:
+        raise ValueError(f"Unknown formation: {formation_name}")
+
+    positions = np.zeros((num_drones, 3), dtype=np.float32)
+    positions[:, :2] = center_xy + offsets[:, :2]
+    positions[:, 2] = altitude
+    return positions
+
+
+def assign_slots(drones_xy: np.ndarray, slots_xy: np.ndarray) -> np.ndarray:
+    num_drones = drones_xy.shape[0]
+
+    try:
+        from scipy.optimize import linear_sum_assignment
+
+        dist = np.linalg.norm(drones_xy[:, None, :] - slots_xy[None, :, :], axis=2)
+        _, col_ind = linear_sum_assignment(dist)
+        return col_ind
+    except Exception:
+        pass
+
+    if num_drones <= 8:
+        best_cost = float("inf")
+        best_perm = None
+        for perm in itertools.permutations(range(num_drones)):
+            perm = np.array(perm, dtype=np.int64)
+            cost = np.linalg.norm(drones_xy - slots_xy[perm], axis=1).sum()
+            if cost < best_cost:
+                best_cost = cost
+                best_perm = perm
+        return best_perm
+
+    remaining = list(range(num_drones))
+    assignments = []
+    for i in range(num_drones):
+        dist = np.linalg.norm(slots_xy[remaining] - drones_xy[i], axis=1)
+        pick = int(np.argmin(dist))
+        assignments.append(remaining[pick])
+        remaining.pop(pick)
+    return np.array(assignments, dtype=np.int64)
+
+
+def spawn_target_markers(
+    env,
+    positions: np.ndarray,
+    radius: float = 0.08,
+    color: tuple = (0.2, 0.4, 1.0, 0.9),
+):
+    client = getattr(env, "_client", None)
+    if client is None:
+        return []
+
+    vis_id = p.createVisualShape(
+        p.GEOM_SPHERE,
+        radius=radius,
+        rgbaColor=color,
+        physicsClientId=client,
+    )
+
+    marker_ids = []
+    for pos in positions:
+        body_id = p.createMultiBody(
+            baseMass=0,
+            baseVisualShapeIndex=vis_id,
+            basePosition=pos.tolist(),
+            physicsClientId=client,
+        )
+        marker_ids.append(body_id)
+
+    if hasattr(env, "register_all_new_bodies"):
+        env.register_all_new_bodies()
+
+    return marker_ids
+
+
+def sample_random_start_positions(
+    num_drones: int,
+    rng: np.random.Generator,
+    xy_limit: float = 5.0,
+    altitude_range: tuple = (0.5, 1.5),
+    min_separation: float = 1.5,
+    max_attempts: int = 2000,
+) -> np.ndarray:
+    positions = []
+    attempts = 0
+
+    while len(positions) < num_drones and attempts < max_attempts:
+        attempts += 1
+        candidate = rng.uniform(-xy_limit, xy_limit, size=3).astype(np.float32)
+        candidate[2] = rng.uniform(altitude_range[0], altitude_range[1])
+
+        if not positions:
+            positions.append(candidate)
+            continue
+
+        existing_xy = np.array(positions, dtype=np.float32)[:, :2]
+        if np.min(np.linalg.norm(existing_xy - candidate[:2], axis=1)) < min_separation:
+            continue
+
+        positions.append(candidate)
+
+    if len(positions) < num_drones:
+        remaining = num_drones - len(positions)
+        extra = rng.uniform(-xy_limit, xy_limit, size=(remaining, 3)).astype(np.float32)
+        extra[:, 2] = rng.uniform(altitude_range[0], altitude_range[1], size=remaining)
+        positions = list(positions) + list(extra)
+
+    return np.asarray(positions, dtype=np.float32)
+
 class InferencePipeline:
     def __init__(self, model_path: str, normalizer_path: str, device: str = None):
         if device is None:
@@ -115,26 +390,23 @@ class InferencePipeline:
 
     def preprocess(self, states, formations):
         """
-        states: numpy array [N, num_state_features]
-            Assuming PyFlyt raw states include [vel_x, vel_y, vel_z, ang_x, ang_y, ang_z, pos_x, pos_y, pos_z]
-            We extract the relevant features based on the normalizer input dimensions.
+        states: numpy array [N, 9]
+            Layout: [pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, ang_x, ang_y, ang_z]
+            Matches data collection: local linear velocity + local angular velocity.
         formations: numpy array [N, 3] one-hot encoding for the formation.
         
         Returns: graph data (x, edge_index, edge_attr, yaw) ready for GNN.
         """
         N = states.shape[0]
         
-        # Assume standard extraction (adjust indices based on your specific PyFlyt observation wrapper)
-        # Typically in PyFlyt QuadX: pos(0:3), vel(3:6), euler(6:9), body_rates(9:12)
-        # We need: vel_x, vel_y, vel_z (3:6 for local/global?), ang_x, ang_y, ang_z (6:9 for euler angles)
-        
+        # We use velocity and angular rates as in the training dataset.
         vel = states[:, 3:6]
-        euler = states[:, 6:9]
+        ang = states[:, 6:9]
         pos = states[:, 0:3]
-        yaw = euler[:, 2] # ang_z
+        yaw = ang[:, 2] # ang_z (matches training normalizer)
         
         vel_t = torch.tensor(vel, dtype=torch.float32, device=self.device)
-        ang_x_y = torch.tensor(euler[:, 0:2], dtype=torch.float32, device=self.device)
+        ang_x_y = torch.tensor(ang[:, 0:2], dtype=torch.float32, device=self.device)
         yaw_t = torch.tensor(yaw, dtype=torch.float32, device=self.device).unsqueeze(1)
         yaw_t = wrap_angle(yaw_t)
         
@@ -177,25 +449,14 @@ class InferencePipeline:
         pos_t = torch.tensor(pos, dtype=torch.float32, device=self.device)
         delta_pos_global = pos_t[dst] - pos_t[src]
         
-        # Coordinate Transformation: Global to Local Body Frame of the SOURCE drone
-        src_yaw = yaw_t[src].squeeze(1)
-        cos_y = torch.cos(src_yaw)
-        sin_y = torch.sin(src_yaw)
-        
         delta_x_global = delta_pos_global[:, 0]
         delta_y_global = delta_pos_global[:, 1]
         delta_z = delta_pos_global[:, 2]
         
-        # Rotation matrix logic:
-        # local_x = global_x * cos(yaw) + global_y * sin(yaw)
-        # local_y = -global_x * sin(yaw) + global_y * cos(yaw)
-        rel_x_local = delta_x_global * cos_y + delta_y_global * sin_y
-        rel_y_local = -delta_x_global * sin_y + delta_y_global * cos_y
-        
         distance = torch.norm(delta_pos_global, dim=1)
         
-        # Edge Attributes: [rel_x, rel_y, rel_z, distance]
-        raw_e = torch.stack([rel_x_local, rel_y_local, delta_z, distance], dim=1)
+        # Edge Attributes: [rel_x, rel_y, rel_z, distance] in global frame
+        raw_e = torch.stack([delta_x_global, delta_y_global, delta_z, distance], dim=1)
         
         # Normalize Edge Attributes
         e_norm = (raw_e - self.edge_mean) / self.edge_std
@@ -243,15 +504,35 @@ def main():
     parser.add_argument("--model", type=str, default="./checkpoints/best_setpoint_gatv2.pt", help="Path to model checkpoint")
     parser.add_argument("--norm", type=str, default="./results/normalizer.json", help="Path to normalizer JSON")
     parser.add_argument("--num_drones", type=int, default=5, help="Number of drones in swarm")
+    parser.add_argument(
+        "formation",
+        nargs="?",
+        default="a",
+        choices=["a", "rectangle", "triangle", "w"],
+        help="Formation type: a, rectangle, triangle, or w",
+    )
     args = parser.parse_args()
 
     pipeline = InferencePipeline(args.model, args.norm)
 
     num_drones = args.num_drones
-    # Spread drones out so they don't collide on takeoff
-    start_pos = np.zeros((num_drones, 3))
-    start_pos[:, 0] = np.linspace(-3, 3, num_drones)
-    start_pos[:, 2] = 0.1 # Start slightly above the ground plane
+    rng = np.random.default_rng()
+    start_pos = sample_random_start_positions(num_drones, rng)
+
+    formation_name = args.formation
+    formation_center = np.mean(start_pos[:, :2], axis=0).astype(np.float32)
+    formation_altitude = 1.5
+    formation_spacing = 2.0
+
+    slot_positions = build_formation_positions(
+        formation_name,
+        num_drones,
+        formation_center,
+        formation_altitude,
+        spacing=formation_spacing,
+    )
+    slot_assignments = assign_slots(start_pos[:, :2], slot_positions[:, :2])
+    final_positions = slot_positions[slot_assignments]
     
     env = Aviary(
         drone_type="quadx",
@@ -268,41 +549,79 @@ def main():
     for i in range(num_drones):
         env.drones[i].set_mode(7) 
 
+    spawn_target_markers(env, final_positions)
+
     print("[*] Forcing Takeoff Phase...")
     # Force drones to 1.5 meters to break ground contact
     for _ in range(50):
         for i in range(num_drones):
-            env.set_setpoint(i, np.array([start_pos[i, 0], 0.0, 1.5, 0.0], dtype=np.float64))
+            env.set_setpoint(i, np.array([start_pos[i, 0], start_pos[i, 1], 0.0, 1.5], dtype=np.float64))
         env.step()
 
     formations = np.zeros((num_drones, 3))
-    formations[:, 0] = 1.0 
+    if formation_name == "a":
+        formations[:, 0] = 1.0
+    elif formation_name == "rectangle":
+        formations[:, 1] = 1.0
+    elif formation_name == "triangle":
+        formations[:, 2] = 1.0
+    elif formation_name == "w":
+        print("[!] 'w' formation is custom and not in the training one-hot set.")
+    else:
+        raise ValueError(f"Unknown formation: {formation_name}")
 
     print("[*] Starting Model-Controlled Flight...")
+    base_pred_gain = 0.45
+    base_goal_gain = 0.35
+    min_goal_gain = 0.12
+    ramp_steps = 200
+    max_step_xy = 0.6
+    max_step_z = 0.4
+    max_step_yaw = 0.25
     for step in range(1200):
         states_list = []
+        yaw_list = []
         for i in range(num_drones):
             s = env.state(i)
-            # PyFlyt order: pos(0:3), vel(3:6), euler(6:9), ang_vel(9:12)
-            flat_state = np.concatenate((s[0], s[2], s[1], s[3]))
+            # PyFlyt order used in data collection: ang_vel, euler, lin_vel, pos
+            global_pos = np.asarray(s[3], dtype=np.float32)
+            local_lin_vel = np.asarray(s[2], dtype=np.float32)
+            local_ang_vel = np.asarray(s[0], dtype=np.float32)
+            global_euler = np.asarray(s[1], dtype=np.float32)
+
+            flat_state = np.concatenate((global_pos, local_lin_vel, local_ang_vel))
             states_list.append(flat_state)
+            yaw_list.append(global_euler[2])
         states = np.array(states_list)
 
         # Get GNN predictions
         setpoints_global = pipeline.predict(states, formations)
         
-        # INCREASED GAIN: Need enough force to move against air resistance
-        gain = 0.8 
+        # Gain ramp to avoid large early excursions
+        ramp = min(1.0, step / ramp_steps)
+        pred_gain = base_pred_gain * ramp
+        goal_gain = min_goal_gain + (base_goal_gain - min_goal_gain) * ramp
         
         for i in range(num_drones):
-            # Calculate next waypoint
-            target_x = states[i, 0] + (setpoints_global[i, 0] * gain)
-            target_y = states[i, 1] + (setpoints_global[i, 1] * gain)
-            # Ensure Z is always high enough to stay airborne
-            target_z = max(1.2, states[i, 2] + (setpoints_global[i, 2] * gain))
-            target_yaw = states[i, 8] + (setpoints_global[i, 3] * gain)
+            # Calculate next waypoint (blend model delta with final target)
+            goal_error = final_positions[i] - states[i, 0:3]
+            blended = (setpoints_global[i, 0:3] * pred_gain) + (goal_error * goal_gain)
 
-            action = np.array([target_x, target_y, target_z, target_yaw], dtype=np.float64)
+            # Clamp per-step movement to avoid flying away then returning
+            xy = blended[0:2]
+            xy_norm = np.linalg.norm(xy)
+            if xy_norm > max_step_xy:
+                xy = (xy / (xy_norm + 1e-6)) * max_step_xy
+            dz = float(np.clip(blended[2], -max_step_z, max_step_z))
+            dyaw = float(np.clip(setpoints_global[i, 3] * pred_gain, -max_step_yaw, max_step_yaw))
+
+            target_x = states[i, 0] + xy[0]
+            target_y = states[i, 1] + xy[1]
+            # Ensure Z is always high enough to stay airborne
+            target_z = max(1.2, states[i, 2] + dz)
+            target_yaw = yaw_list[i] + dyaw
+
+            action = np.array([target_x, target_y, target_yaw, target_z], dtype=np.float64)
             env.set_setpoint(i, action)
 
         # Step the physics twice to allow for mechanical lag
