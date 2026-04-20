@@ -780,7 +780,7 @@ def generate_dataset_parallel(
 if __name__ == "__main__":
     # Test execution
     generated_files, metadata_path = generate_dataset_parallel(
-        num_workers=10,
+        num_workers=1,
         dataset_name="set_point_prediction_dataset_parallel",
         dataset_type="mixed_formations",
         task_type="setpoint_prediction",
