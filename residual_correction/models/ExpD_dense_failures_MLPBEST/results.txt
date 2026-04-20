@@ -1,6 +1,0 @@
-Zero baseline
-Test: 0.6774
-GAT
-Test: 0.6267 ✅
-MLP
-Test: 0.6169 ✅ (best)

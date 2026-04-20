@@ -1,8 +1,0 @@
-Zero baseline
-Test: 0.5781
-GAT
-Best val: 0.5721
-Test: 0.5533 ✅
-MLP
-Best val: 0.5742
-Test: 0.5281 ✅
