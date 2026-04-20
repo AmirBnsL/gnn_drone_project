@@ -1,0 +1,12 @@
+Zero baseline
+Val: 0.2240
+Test: 0.2038
+MLP
+Best val: 0.2214 ✅ (better than zero)
+Test: 0.2120 ❌ (worse than zero)
+GAT ⭐
+Best val: 0.2168 ✅ (BEST)
+Test: 0.1978 ✅ (BEST)
+NNConv
+Val: 0.2467 ❌
+Test: 0.2277 ❌

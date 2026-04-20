@@ -1,0 +1,6 @@
+Zero baseline
+Test: 0.2802
+GAT
+Test: 0.2773 ✅
+MLP
+Test: 0.2793 (≈ same as zero)

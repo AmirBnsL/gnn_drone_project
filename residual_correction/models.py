@@ -131,7 +131,7 @@ class NNConvResidualRegressor(nn.Module):
         )
 
     def forward(self, data):
-        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr
+        x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
         batch = getattr(data, "batch", None)
         if batch is None:
             batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
@@ -160,7 +160,7 @@ def build_model(model_name: str, in_dim: int = 13):
     elif model_name == "nnconv":
         return NNConvResidualRegressor(in_dim=in_dim)
     else:
-        raise ValueError(f"Unknown model_name '{model_name}'. Use 'mlp' or 'gat' or 'zero'.")
+        raise ValueError(f"Unknown model_name '{model_name}'. Use 'mlp' or 'gat' or 'zero' or 'nnconv'.")
 
 
 if __name__ == "__main__":
@@ -170,7 +170,7 @@ if __name__ == "__main__":
     train_dataset, _, _ = get_datasets(dataset_dir)
     sample = train_dataset[0]
 
-    for name in ["zero","mlp", "gat"]:
+    for name in ["zero","mlp", "gat","nnconv"]:
         model = build_model(name, in_dim=sample.x.shape[1])
         out = model(sample)
         print(f"\nModel: {name}")

@@ -5,7 +5,8 @@ import torch
 
 DATASET_DIR = Path("residual_correction/datasets")
 #DATASET_NAME = "residual_test_mixed_formations"
-DATASET_NAME = "residual_main_mixed_formations"
+# DATASET_NAME = "residual_main_mixed_formations"
+DATASET_NAME = "residual_failures_dense_mixed_formations"
 SPLIT = "train"
 
 
