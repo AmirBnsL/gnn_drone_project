@@ -1,4 +1,5 @@
 import cProfile
+import io
 import json
 import os
 import time
@@ -10,6 +11,7 @@ from tqdm import tqdm
 import numpy as np
 import pybullet as p
 import torch
+from safetensors.torch import load_file, save_file
 from scipy.optimize import linear_sum_assignment
 from torch_geometric.data import Data, HeteroData, InMemoryDataset
 
@@ -58,25 +60,35 @@ def sample_episode_initial_conditions(
     start_orn[:, 2] = rng.uniform(-np.pi, np.pi, size=(num_drones,))
     return start_pos, start_orn
 
+
 def sample_obstacles(
     rng: np.random.Generator,
     num_obstacles: int,
     xy_limit: float,
+    z_limit: tuple[float, float],
     obstacle_radius: float = 1.0,
     obstacle_radius_range: tuple[float, float] | None = None,
 ):
     if num_obstacles == 0:
-        return np.zeros((0, 2)), np.zeros((0,), dtype=np.float32)
+        return np.zeros((0, 3)), np.zeros((0,), dtype=np.float32)
 
-    obstacles = rng.uniform(-xy_limit, xy_limit, size=(num_obstacles, 2))
+    xy = rng.uniform(-xy_limit, xy_limit, size=(num_obstacles, 2))
+    z = rng.uniform(z_limit[0], z_limit[1], size=(num_obstacles, 1))
+    obstacles = np.hstack((xy, z)).astype(np.float32)
+
     if obstacle_radius_range is not None:
         low = float(min(obstacle_radius_range))
         high = float(max(obstacle_radius_range))
-        obstacle_radii = rng.uniform(low, high, size=(num_obstacles,)).astype(np.float32)
+        obstacle_radii = rng.uniform(low, high, size=(num_obstacles,)).astype(
+            np.float32
+        )
     else:
-        obstacle_radii = np.full((num_obstacles,), float(obstacle_radius), dtype=np.float32)
+        obstacle_radii = np.full(
+            (num_obstacles,), float(obstacle_radius), dtype=np.float32
+        )
 
     return obstacles, obstacle_radii
+
 
 def resolve_formation_name(dataset_type: str):
     if dataset_type in {"a", "formation_a"}: return "a"
@@ -171,10 +183,11 @@ def _formation_triangle_offsets(num_drones: int, spacing: float = 2.0):
 def apply_obstacle_avoidance(slots, obstacles, obstacle_radii, padding=1.0):
     if len(obstacles) == 0: return slots
     safe_slots = np.copy(slots)
+    obs_xy = np.asarray(obstacles, dtype=np.float32)[:, :2]
     if obstacle_radii is None or len(obstacle_radii) == 0:
         obstacle_radii = np.ones((len(obstacles),), dtype=np.float32)
     for i in range(len(safe_slots)):
-        for obs_idx, obs in enumerate(obstacles):
+        for obs_idx, obs in enumerate(obs_xy):
             min_dist = float(obstacle_radii[obs_idx]) + padding
             diff = safe_slots[i, :2] - obs
             dist = np.linalg.norm(diff)
@@ -213,32 +226,46 @@ def _build_formation_setpoints(
 
     return setpoints, assigned_indices, offsets
 
+
 def create_aviary(
     start_pos: np.ndarray,
     start_orn: np.ndarray,
     environmental_wind: bool,
-    obstacles: np.ndarray = np.empty((0, 2)),
+    obstacles: np.ndarray = np.empty((0, 3)), 
     obstacle_radii: np.ndarray | None = None,
     obstacle_radius: float = 1.0,
     graphical: bool = False,
 ):
-    
     drone_options = dict()
     drone_options["control_hz"] = 60
-    env = Aviary(start_pos=start_pos, start_orn=start_orn, drone_type="quadx", render=graphical,physics_hz=240 ,drone_options=drone_options)
-    if environmental_wind: env.register_wind_field_function(wind_generator)
+    env = Aviary(start_pos=start_pos, start_orn=start_orn, drone_type="quadx", render=graphical, physics_hz=240, drone_options=drone_options)
+    
+    if environmental_wind: 
+        env.register_wind_field_function(wind_generator)
+        
     env.set_mode(7)
+    
     if len(obstacles) > 0:
         physics_client = env._client
         if obstacle_radii is None or len(obstacle_radii) == 0:
             obstacle_radii_arr = np.full((len(obstacles),), obstacle_radius, dtype=np.float32)
         else:
             obstacle_radii_arr = np.asarray(obstacle_radii, dtype=np.float32)
+            
         for obs, obs_radius in zip(obstacles, obstacle_radii_arr):
-            col_id = p.createCollisionShape(p.GEOM_CYLINDER, radius=float(obs_radius), height=10.0, physicsClientId=physics_client)
-            vis_id = p.createVisualShape(p.GEOM_CYLINDER, radius=float(obs_radius), length=10.0, rgbaColor=[1, 0, 0, 0.5], physicsClientId=physics_client)
-            p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col_id, baseVisualShapeIndex=vis_id, basePosition=[obs[0], obs[1], 5.0], physicsClientId=physics_client)
+            col_id = p.createCollisionShape(p.GEOM_SPHERE, radius=float(obs_radius), physicsClientId=physics_client)
+            vis_id = p.createVisualShape(p.GEOM_SPHERE, radius=float(obs_radius), rgbaColor=[1, 0, 0, 0.5], physicsClientId=physics_client)
+            
+            p.createMultiBody(
+                baseMass=0, 
+                baseCollisionShapeIndex=col_id, 
+                baseVisualShapeIndex=vis_id, 
+                basePosition=[obs[0], obs[1], obs[2]], 
+                physicsClientId=physics_client
+            )
+            
         env.register_all_new_bodies()
+        
     return env
 
 def build_setpoints(
@@ -279,6 +306,7 @@ def maybe_add_sensor_noise(global_pos, global_euler, local_lin_vel, local_ang_ve
     local_ang_vel = local_ang_vel + np.random.normal(0, noise_variance, size=3)
     return global_pos, global_euler, local_lin_vel, local_ang_vel
 
+
 def compute_apf_setpoints(
     current_positions: np.ndarray,
     final_setpoints: np.ndarray,
@@ -301,25 +329,29 @@ def compute_apf_setpoints(
     attractive[:, :2] *= attractive_gain
     attractive[:, 2] *= vertical_gain
 
-    repulsive_xy = np.zeros((len(current_positions), 2), dtype=np.float32)
+    repulsive_xyz = np.zeros((len(current_positions), 3), dtype=np.float32)
+
     if len(obstacles) > 0:
         if obstacle_radii is None or len(obstacle_radii) == 0:
             obstacle_radii = np.ones((len(obstacles),), dtype=np.float32)
 
-        diff = current_positions[:, None, :2] - obstacles[None, :, :]
+        diff = current_positions[:, None, :3] - obstacles[None, :, :3]
         dist = np.linalg.norm(diff, axis=2) + 1e-6
+
         influence_radius = obstacle_radii[None, :] + repulsion_padding
         inside_influence = dist < influence_radius
 
         safe_dist = np.maximum(dist, 1e-3)
-        repulse_strength = repulsive_gain * (1.0 / safe_dist - 1.0 / influence_radius) / (safe_dist**2)
+        repulse_strength = (
+            repulsive_gain * (1.0 / safe_dist - 1.0 / influence_radius) / (safe_dist**2)
+        )
         repulse_strength = np.where(inside_influence, repulse_strength, 0.0)
 
         direction = diff / safe_dist[..., None]
-        repulsive_xy = np.sum(repulse_strength[..., None] * direction, axis=1)
+        repulsive_xyz = np.sum(repulse_strength[..., None] * direction, axis=1)
 
     total_delta = np.copy(attractive)
-    total_delta[:, :2] += repulsive_xy
+    total_delta[:, :3] += repulsive_xyz
 
     norm = np.linalg.norm(total_delta, axis=1, keepdims=True)
     scale = np.minimum(1.0, max_step_size / (norm + 1e-6))
@@ -333,18 +365,79 @@ def compute_apf_setpoints(
     intermediate_setpoints[:, 3] = intermediate_positions[:, 2]
     return intermediate_setpoints
 
-def compute_lidar_features(global_pos, global_euler, obstacles, obstacle_radii, num_rays=16, max_range=5.0):
-    """Batched 2D LiDAR raycasting for all drones: returns (N, num_rays)."""
-    pos = np.asarray(global_pos, dtype=np.float32)
-    euler = np.asarray(global_euler, dtype=np.float32)
-    num_drones = pos.shape[0]
+
+def compute_lidar_features(
+    global_pos: np.ndarray,
+    global_euler: np.ndarray,
+    obstacles: np.ndarray,
+    obstacle_radii: np.ndarray,
+    physics_client: int | None = None,
+    num_azimuth: int = 16,
+    num_elevation: int = 4,
+    fov_up_deg: float = 15.0,
+    fov_down_deg: float = -15.0,
+    max_range: float = 5.0,
+):
+    num_drones = global_pos.shape[0]
+    num_rays = num_azimuth * num_elevation
 
     if num_drones == 0:
         return np.zeros((0, num_rays), dtype=np.float32)
 
-    obs_features = np.full((num_drones, num_rays), max_range, dtype=np.float32)
+    azimuths = np.linspace(0.0, 2.0 * np.pi, num_azimuth, endpoint=False, dtype=np.float32)
+    if num_elevation > 1:
+        elevations = np.linspace(
+            np.radians(fov_down_deg),
+            np.radians(fov_up_deg),
+            num_elevation,
+            dtype=np.float32,
+        )
+    else:
+        elevations = np.array([0.0], dtype=np.float32)
+
+    az_grid, el_grid = np.meshgrid(azimuths, elevations, indexing="ij")
+    local_rays = np.stack(
+        [
+            np.cos(el_grid) * np.cos(az_grid),
+            np.cos(el_grid) * np.sin(az_grid),
+            np.sin(el_grid),
+        ],
+        axis=-1,
+    ).reshape(-1, 3)
+
+    r, pt, y = global_euler[:, 0], global_euler[:, 1], global_euler[:, 2]
+    cx, sx = np.cos(r), np.sin(r)
+    cy, sy = np.cos(pt), np.sin(pt)
+    cz, sz = np.cos(y), np.sin(y)
+
+    rot_matrices = np.zeros((num_drones, 3, 3), dtype=np.float32)
+    rot_matrices[:, 0, 0] = cy * cz
+    rot_matrices[:, 0, 1] = sx * sy * cz - cx * sz
+    rot_matrices[:, 0, 2] = cx * sy * cz + sx * sz
+    rot_matrices[:, 1, 0] = cy * sz
+    rot_matrices[:, 1, 1] = sx * sy * sz + cx * cz
+    rot_matrices[:, 1, 2] = cx * sy * sz - sx * cz
+    rot_matrices[:, 2, 0] = -sy
+    rot_matrices[:, 2, 1] = sx * cy
+    rot_matrices[:, 2, 2] = cx * cy
+
+    global_rays = np.einsum("nij,rj->nri", rot_matrices, local_rays, optimize=True)
+
+    if physics_client is not None:
+        ray_starts = np.repeat(global_pos[:, None, :], num_rays, axis=1)
+        ray_ends = ray_starts + (global_rays * max_range)
+        flat_starts = ray_starts.reshape(-1, 3).tolist()
+        flat_ends = ray_ends.reshape(-1, 3).tolist()
+        results = p.rayTestBatch(
+            rayFromPositions=flat_starts,
+            rayToPositions=flat_ends,
+            physicsClientId=physics_client,
+        )
+        hit_fractions = np.array([res[2] for res in results], dtype=np.float32)
+        return hit_fractions.reshape(num_drones, num_rays) * max_range
+
     if len(obstacles) == 0:
-        return obs_features
+        return np.full((num_drones, num_rays), max_range, dtype=np.float32)
 
     obs = np.asarray(obstacles, dtype=np.float32)
     if obstacle_radii is None or len(obstacle_radii) == 0:
@@ -352,30 +445,23 @@ def compute_lidar_features(global_pos, global_euler, obstacles, obstacle_radii, 
     else:
         radii = np.asarray(obstacle_radii, dtype=np.float32)
 
-    base_angles = np.linspace(0.0, 2.0 * np.pi, num_rays, endpoint=False, dtype=np.float32)
-    angles = euler[:, 2:3] + base_angles[None, :]
-    rays = np.stack([np.cos(angles), np.sin(angles)], axis=-1)  # (N, R, 2)
+    ray_dirs = global_rays[:, None, :, :]  # (N, 1, R, 3)
+    oc = global_pos[:, None, None, :] - obs[None, :, None, :]  # (N, O, 1, 3)
+    b = 2.0 * np.sum(oc * ray_dirs, axis=-1)  # (N, O, R)
+    c = np.sum(oc * oc, axis=-1) - (radii[None, :, None] ** 2)  # (N, O, 1)
+    disc = b**2 - 4.0 * c
 
-    w = obs[None, :, :] - pos[:, None, :2]  # (N, O, 2)
-    t = np.einsum("noj,nrj->nor", w, rays, optimize=True)  # (N, O, R)
-    hit_mask = t > 0.0
+    sqrt_disc = np.sqrt(np.maximum(disc, 0.0))
+    t1 = (-b - sqrt_disc) * 0.5
+    t2 = (-b + sqrt_disc) * 0.5
+    t_hit = np.where(t1 > 0.0, t1, t2)
+    valid_hit = (disc >= 0.0) & (t_hit > 0.0)
+    hit_dists = np.where(valid_hit, t_hit, max_range)
+    hit_dists = np.where(hit_dists > 0.0, hit_dists, max_range)
+    return np.minimum(np.min(hit_dists, axis=1), max_range)
 
-    w_sq = np.einsum("noj,noj->no", w, w, optimize=True)[:, :, None]  # (N, O, 1)
-    d_sq = w_sq - t**2  # (N, O, R)
 
-    r_sq = (radii[None, :, None]) ** 2  # (1, O, 1)
-    valid_hit = hit_mask & (d_sq <= r_sq)
-
-    if np.any(valid_hit):
-        safe_d_sq = np.clip(d_sq, 0.0, r_sq)
-        hit_dists = t - np.sqrt(np.maximum(0.0, r_sq - safe_d_sq))
-        hit_dists = np.where(valid_hit, hit_dists, max_range)
-        hit_dists = np.where(hit_dists > 0.0, hit_dists, max_range)
-        obs_features = np.minimum(obs_features, np.min(hit_dists, axis=1))
-
-    return obs_features
-
-def build_drone_features(drone, drone_idx, setpoint, assigned_slot_idx, naive_offset, task_type, noisy_sensors, noise_variance, formation_one_hot, obstacles, obstacle_radii, include_formation_in_state, start_pos_center, precomputed_state=None):
+def build_drone_features(drone, drone_idx, setpoint, assigned_slot_idx, naive_offset, task_type, noisy_sensors, noise_variance, formation_one_hot, obstacles, obstacle_radii, include_formation_in_state, start_pos_center, physics_client=None, precomputed_state=None):
     if precomputed_state is None:
         state = drone.state
         global_pos = np.array(state[3], copy=True)
@@ -388,7 +474,11 @@ def build_drone_features(drone, drone_idx, setpoint, assigned_slot_idx, naive_of
         )
 
         obs_features = compute_lidar_features(
-            global_pos[None, :], global_euler[None, :], obstacles, obstacle_radii
+            global_pos[None, :],
+            global_euler[None, :],
+            obstacles,
+            obstacle_radii,
+            physics_client=physics_client,
         )[0]
     else:
         global_pos = precomputed_state["global_pos"]
@@ -429,14 +519,29 @@ def build_drone_features(drone, drone_idx, setpoint, assigned_slot_idx, naive_of
     return gnn_input_state, y_label, drone.pwm, global_pos
 
 
-def build_edges(global_positions: np.ndarray, communication_radius: float):
+def build_edges(
+    global_positions: np.ndarray,
+    communication_radius: float,
+    global_velocities: np.ndarray | None = None,
+):
+    """Build communication graph edges with rich 3D attributes.
+    
+    Edge attrs per edge (i->j):
+      [0] rel_x
+      [1] rel_y
+      [2] rel_z
+      [3] dist
+      [4] rel_vx
+      [5] rel_vy
+      [6] rel_vz
+    """
     pos = np.asarray(global_positions, dtype=np.float32)
     num_drones = pos.shape[0]
 
     if num_drones < 2:
         return [], []
 
-    # rel[i, j] = pos[j] - pos[i] (same as old rel_pos definition)
+    # rel[i, j] = pos[j] - pos[i]
     rel = pos[None, :, :] - pos[:, None, :]  # shape: (N, N, 3)
 
     # Exclude self-edges
@@ -445,7 +550,6 @@ def build_edges(global_positions: np.ndarray, communication_radius: float):
     if np.isinf(communication_radius):
         mask = not_self
     else:
-        # Squared distance matrix in C-backed NumPy ops
         dist_sq = np.einsum("ijk,ijk->ij", rel, rel)
         radius_sq = float(communication_radius) ** 2
         mask = (dist_sq <= radius_sq) & not_self
@@ -453,7 +557,21 @@ def build_edges(global_positions: np.ndarray, communication_radius: float):
     src, dst = np.nonzero(mask)
 
     edges = np.column_stack((src, dst)).tolist()
-    edge_attrs = rel[src, dst].tolist()
+    
+    # Compute distances
+    dists = np.linalg.norm(rel[src, dst], axis=1, keepdims=True)  # (E, 1)
+    
+    # Compute relative velocities if provided
+    if global_velocities is not None and len(global_velocities) == num_drones:
+        vel = np.asarray(global_velocities, dtype=np.float32)
+        rel_vel = vel[None, :, :] - vel[:, None, :]  # (N, N, 3)
+        rel_vel_attrs = rel_vel[src, dst]  # (E, 3)
+        edge_attrs = np.hstack([rel[src, dst], dists, rel_vel_attrs]).tolist()
+    else:
+        # Zero velocities for residual correction (no physics)
+        zero_vel = np.zeros((len(src), 3), dtype=np.float32)
+        edge_attrs = np.hstack([rel[src, dst], dists, zero_vel]).tolist()
+    
     return edges, edge_attrs
 
 
@@ -479,7 +597,14 @@ def collect_step_data(env, active_drones, setpoints, slot_assignments, naive_off
 
     global_positions = np.asarray([entry["global_pos"] for entry in precomputed], dtype=np.float32)
     global_eulers = np.asarray([entry["global_euler"] for entry in precomputed], dtype=np.float32)
-    obs_features_batch = compute_lidar_features(global_positions, global_eulers, obstacles, obstacle_radii)
+    global_velocities = np.asarray([entry["local_lin_vel"] for entry in precomputed], dtype=np.float32)
+    obs_features_batch = compute_lidar_features(
+        global_positions,
+        global_eulers,
+        obstacles,
+        obstacle_radii,
+        physics_client=env._client,
+    )
 
     for i, drone_idx in enumerate(active_drones):
         drone = env.drones[drone_idx]
@@ -500,13 +625,14 @@ def collect_step_data(env, active_drones, setpoints, slot_assignments, naive_off
             obstacle_radii,
             include_formation_in_state,
             start_pos_center,
+            physics_client=env._client,
             precomputed_state=precomputed[i],
         )
         episode_states.append(gnn_input_state)
         episode_targets.append(gnn_input_target)
         episode_labels.append(motor_pwm_labels)
 
-    edges, edge_attrs = build_edges(global_positions, communication_radius)
+    edges, edge_attrs = build_edges(global_positions, communication_radius, global_velocities)
     return episode_states, episode_targets, episode_labels, edges, edge_attrs, global_positions.tolist()
 
 def compute_split_episode_counts(num_episodes, split_ratios):
@@ -536,11 +662,31 @@ def write_dataset_metadata(metadata_path, metadata):
         json.dump(metadata, metadata_file, indent=2)
         metadata_file.write("\n")
 
+def save_object_safetensors(file_path: str, payload_obj) -> None:
+    """Persist an arbitrary Python object inside a safetensors file.
+
+    The object is first serialized with torch.save to bytes and then stored
+    as a uint8 tensor under key 'payload'.
+    """
+    buffer = io.BytesIO()
+    torch.save(payload_obj, buffer)
+    byte_arr = np.frombuffer(buffer.getvalue(), dtype=np.uint8).copy()
+    tensor_payload = torch.from_numpy(byte_arr)
+    save_file({"payload": tensor_payload}, file_path)
+
+def load_object_safetensors(file_path: str):
+    """Load an arbitrary Python object previously saved with save_object_safetensors."""
+    tensors = load_file(file_path)
+    if "payload" not in tensors:
+        raise ValueError(f"Invalid safetensors payload file: {file_path}")
+    payload_bytes = tensors["payload"].cpu().numpy().tobytes()
+    return torch.load(io.BytesIO(payload_bytes), weights_only=False)
+
 def save_dataset(dataset_path, all_graphs, formation_names, split_name):
     data, slices = InMemoryDataset.collate(all_graphs)
-    torch.save(
-        {"data": data, "slices": slices, "formation_names": formation_names, "split_name": split_name},
+    save_object_safetensors(
         dataset_path,
+        {"data": data, "slices": slices, "formation_names": formation_names, "split_name": split_name},
     )
 
 
@@ -559,7 +705,7 @@ def convert_history_to_graphs(raw_history, task_type, active_drones, naive_offse
             edge_attr = torch.as_tensor(np.asarray(step_data["edge_attrs"]), dtype=torch.float32)
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
-            edge_attr = torch.empty((0, 3), dtype=torch.float32)
+            edge_attr = torch.empty((0, 7), dtype=torch.float32)
 
         if task_type == "formation_assignment_hetero":
             graph = HeteroData()
@@ -620,7 +766,7 @@ def generate_residual_correction_sample(
     
     # Sample obstacles
     obstacles, obstacle_radii = sample_obstacles(
-        rng, num_obstacles, xy_limit=5.0, obstacle_radius=obstacle_radius, obstacle_radius_range=obstacle_radius_range
+        rng, num_obstacles, xy_limit=5.0, z_limit=altitude_range, obstacle_radius=obstacle_radius, obstacle_radius_range=obstacle_radius_range
     )
     
     # Build setpoints with obstacle avoidance
@@ -652,9 +798,9 @@ def generate_residual_correction_sample(
             local_lin_vel = np.random.normal(0, noise_variance, size=3).astype(np.float32)
             local_ang_vel = np.random.normal(0, noise_variance, size=3).astype(np.float32)
         
-        # LiDAR features
+        # LiDAR features (3D geometric fallback for residual correction)
         obs_features = compute_lidar_features(
-            start_pos[i:i+1], start_orn[i:i+1], obstacles, obstacle_radii
+            start_pos[i:i+1], start_orn[i:i+1], obstacles, obstacle_radii, physics_client=None
         )[0]
         
         # Build node features
@@ -665,7 +811,7 @@ def generate_residual_correction_sample(
         # Compute residual label
         target_global_pos = np.array([setpoints[i, 0], setpoints[i, 1], setpoints[i, 3]])
         # Handle case where naive_offsets might be empty (use zero offset)
-        if naive_offsets is not None and len(naive_offsets) > 0:
+        if naive_offsets is not None and col_ind is not None and len(naive_offsets) > 0:
             naive_offset = naive_offsets[col_ind[i]]
         else:
             naive_offset = np.zeros(3, dtype=np.float32)
@@ -683,8 +829,9 @@ def generate_residual_correction_sample(
         ep_targets.append(y_label)
         ep_labels.append(motor_pwm_labels)
     
-    # Build edges
-    edges, edge_attrs = build_edges(start_pos, communication_radius)
+    # Build edges with zero velocities (no physics simulation)
+    zero_velocities = np.zeros_like(start_pos, dtype=np.float32)
+    edges, edge_attrs = build_edges(start_pos, communication_radius, zero_velocities)
     
     # Create graph
     x = torch.as_tensor(np.asarray(ep_states), dtype=torch.float32)
@@ -783,8 +930,8 @@ def generate_residual_correction_batch(config: dict):
         graphs.append(graph)
     
     # Save graphs
-    temp_file = os.path.join(config["temp_dir"], f"ep_{config['global_episode_id']}.pt")
-    torch.save(graphs, temp_file)
+    temp_file = os.path.join(config["temp_dir"], f"ep_{config['global_episode_id']}.safetensors")
+    save_object_safetensors(temp_file, graphs)
     
     episode_record = {
         "episode_id": config["global_episode_id"],
@@ -837,6 +984,7 @@ def simulate_episode(config: dict):
         rng,
         current_num_obstacles,
         xy_limit=5.0,
+        z_limit=config["altitude_range"],
         obstacle_radius=config["obstacle_radius"],
         obstacle_radius_range=config.get("obstacle_radius_range"),
     )
@@ -1023,8 +1171,8 @@ def simulate_episode(config: dict):
     )
     
     # Save the generated graphs for this episode to a temporary file on disk (bypassing IPC serialization bottlenecks)
-    temp_file = os.path.join(config["temp_dir"], f"ep_{config['global_episode_id']}.pt")
-    torch.save(graphs, temp_file)
+    temp_file = os.path.join(config["temp_dir"], f"ep_{config['global_episode_id']}.safetensors")
+    save_object_safetensors(temp_file, graphs)
 
     episode_center = np.mean(start_pos[:, :2], axis=0)
     initial_xy_radius = float(np.max(np.linalg.norm(start_pos[:, :2] - episode_center, axis=1)))
@@ -1203,10 +1351,10 @@ def generate_dataset_parallel(
         
         all_graphs = []
         for temp_path in temp_paths:
-            all_graphs.extend(torch.load(temp_path, weights_only=False))
+            all_graphs.extend(load_object_safetensors(temp_path))
             os.remove(temp_path)  # Delete temp file as we build the final split
             
-        split_dataset_path = f"{dataset_prefix}_{split_name}.pt"
+        split_dataset_path = f"{dataset_prefix}_{split_name}.safetensors"
         save_dataset(split_dataset_path, all_graphs, FORMATION_NAMES, split_name)
         generated_files[split_name] = os.path.basename(split_dataset_path)
         print(f"Generated {split_name} dataset -> {split_dataset_path}")
@@ -1268,17 +1416,16 @@ if __name__ == "__main__":
     # Test execution
     generated_files, metadata_path = generate_dataset_parallel(
         num_workers=6,
-        dataset_name="set_point_prediction_dataset_parallel_apf_600",
+        dataset_name="residual_correction_dataset_parallel_apf_40000",
         dataset_type="mixed_formations",
-        task_type="setpoint_prediction",
+        task_type="residual_correction",
         noisy_sensors=False,
         environmental_wind=False,
         dynamic_formation=False,
         inject_failures=False,
         communication_radius=10.0,
         include_formation_in_state=True,
-        max_steps=3000,
-        num_episodes=600,
+        num_episodes=40000,
         residual_samples_per_seed=50,  # Generate 50 samples per seed (500 total samples)
         tapered_sampling=True,
         conv_stopping=True,
