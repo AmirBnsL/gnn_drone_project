@@ -1,3 +1,4 @@
+import cProfile
 import json
 import os
 import time
@@ -13,6 +14,11 @@ from scipy.optimize import linear_sum_assignment
 from torch_geometric.data import Data, HeteroData, InMemoryDataset
 
 from PyFlyt.core import Aviary
+
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 # ---------------------------------------------------------
 # CONSTANTS
@@ -52,10 +58,25 @@ def sample_episode_initial_conditions(
     start_orn[:, 2] = rng.uniform(-np.pi, np.pi, size=(num_drones,))
     return start_pos, start_orn
 
-def sample_obstacles(rng: np.random.Generator, num_obstacles: int, xy_limit: float):
+def sample_obstacles(
+    rng: np.random.Generator,
+    num_obstacles: int,
+    xy_limit: float,
+    obstacle_radius: float = 1.0,
+    obstacle_radius_range: tuple[float, float] | None = None,
+):
     if num_obstacles == 0:
-        return np.zeros((0, 2))
-    return rng.uniform(-xy_limit, xy_limit, size=(num_obstacles, 2))
+        return np.zeros((0, 2)), np.zeros((0,), dtype=np.float32)
+
+    obstacles = rng.uniform(-xy_limit, xy_limit, size=(num_obstacles, 2))
+    if obstacle_radius_range is not None:
+        low = float(min(obstacle_radius_range))
+        high = float(max(obstacle_radius_range))
+        obstacle_radii = rng.uniform(low, high, size=(num_obstacles,)).astype(np.float32)
+    else:
+        obstacle_radii = np.full((num_obstacles,), float(obstacle_radius), dtype=np.float32)
+
+    return obstacles, obstacle_radii
 
 def resolve_formation_name(dataset_type: str):
     if dataset_type in {"a", "formation_a"}: return "a"
@@ -147,12 +168,14 @@ def _formation_triangle_offsets(num_drones: int, spacing: float = 2.0):
     offsets[:, :2] -= np.mean(offsets[:, :2], axis=0)
     return offsets
 
-def apply_obstacle_avoidance(slots, obstacles, obstacle_radius, padding=1.0):
+def apply_obstacle_avoidance(slots, obstacles, obstacle_radii, padding=1.0):
     if len(obstacles) == 0: return slots
     safe_slots = np.copy(slots)
-    min_dist = obstacle_radius + padding
+    if obstacle_radii is None or len(obstacle_radii) == 0:
+        obstacle_radii = np.ones((len(obstacles),), dtype=np.float32)
     for i in range(len(safe_slots)):
-        for obs in obstacles:
+        for obs_idx, obs in enumerate(obstacles):
+            min_dist = float(obstacle_radii[obs_idx]) + padding
             diff = safe_slots[i, :2] - obs
             dist = np.linalg.norm(diff)
             if dist < min_dist:
@@ -160,7 +183,12 @@ def apply_obstacle_avoidance(slots, obstacles, obstacle_radius, padding=1.0):
                 safe_slots[i, :2] = obs + direction * min_dist
     return safe_slots
 
-def _build_formation_setpoints(formation_name: str, start_pos: np.ndarray, obstacles=np.empty((0, 2)), obstacle_radius=0.0):
+def _build_formation_setpoints(
+    formation_name: str,
+    start_pos: np.ndarray,
+    obstacles=np.empty((0, 2)),
+    obstacle_radii=np.empty((0,)),
+):
     num_drones = len(start_pos)
     formation_center = np.mean(start_pos[:, :2], axis=0)
     target_altitude = np.mean(start_pos[:, 2])
@@ -172,7 +200,7 @@ def _build_formation_setpoints(formation_name: str, start_pos: np.ndarray, obsta
 
     global_slots = np.zeros((num_drones, 3))
     global_slots[:, :2] = formation_center + offsets[:, :2]
-    safe_global_slots = apply_obstacle_avoidance(global_slots, obstacles, obstacle_radius, padding=1.0)
+    safe_global_slots = apply_obstacle_avoidance(global_slots, obstacles, obstacle_radii, padding=1.0)
     dist_matrix = np.linalg.norm(start_pos[:, None, :2] - safe_global_slots[None, :, :2], axis=2)
     _, assigned_indices = linear_sum_assignment(dist_matrix)
 
@@ -185,24 +213,49 @@ def _build_formation_setpoints(formation_name: str, start_pos: np.ndarray, obsta
 
     return setpoints, assigned_indices, offsets
 
-def create_aviary(start_pos: np.ndarray, start_orn: np.ndarray, environmental_wind: bool, obstacles: np.ndarray = np.empty((0, 2)), obstacle_radius: float = 1.0, graphical: bool = False):
-    env = Aviary(start_pos=start_pos, start_orn=start_orn, drone_type="quadx", render=graphical)
+def create_aviary(
+    start_pos: np.ndarray,
+    start_orn: np.ndarray,
+    environmental_wind: bool,
+    obstacles: np.ndarray = np.empty((0, 2)),
+    obstacle_radii: np.ndarray | None = None,
+    obstacle_radius: float = 1.0,
+    graphical: bool = False,
+):
+    
+    drone_options = dict()
+    drone_options["control_hz"] = 60
+    env = Aviary(start_pos=start_pos, start_orn=start_orn, drone_type="quadx", render=graphical,physics_hz=240 ,drone_options=drone_options)
     if environmental_wind: env.register_wind_field_function(wind_generator)
     env.set_mode(7)
     if len(obstacles) > 0:
         physics_client = env._client
-        for obs in obstacles:
-            col_id = p.createCollisionShape(p.GEOM_CYLINDER, radius=obstacle_radius, height=10.0, physicsClientId=physics_client)
-            vis_id = p.createVisualShape(p.GEOM_CYLINDER, radius=obstacle_radius, length=10.0, rgbaColor=[1, 0, 0, 0.5], physicsClientId=physics_client)
+        if obstacle_radii is None or len(obstacle_radii) == 0:
+            obstacle_radii_arr = np.full((len(obstacles),), obstacle_radius, dtype=np.float32)
+        else:
+            obstacle_radii_arr = np.asarray(obstacle_radii, dtype=np.float32)
+        for obs, obs_radius in zip(obstacles, obstacle_radii_arr):
+            col_id = p.createCollisionShape(p.GEOM_CYLINDER, radius=float(obs_radius), height=10.0, physicsClientId=physics_client)
+            vis_id = p.createVisualShape(p.GEOM_CYLINDER, radius=float(obs_radius), length=10.0, rgbaColor=[1, 0, 0, 0.5], physicsClientId=physics_client)
             p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col_id, baseVisualShapeIndex=vis_id, basePosition=[obs[0], obs[1], 5.0], physicsClientId=physics_client)
         env.register_all_new_bodies()
     return env
 
-def build_setpoints(dataset_type: str, start_pos: np.ndarray, start_orn: np.ndarray, rng: np.random.Generator, obstacles: np.ndarray = np.empty((0, 2)), obstacle_radius: float = 1.0):
+def build_setpoints(
+    dataset_type: str,
+    start_pos: np.ndarray,
+    start_orn: np.ndarray,
+    rng: np.random.Generator,
+    obstacles: np.ndarray = np.empty((0, 2)),
+    obstacle_radii: np.ndarray | None = None,
+    obstacle_radius: float = 1.0,
+):
     num_drones = len(start_pos)
+    if obstacle_radii is None:
+        obstacle_radii = np.full((len(obstacles),), obstacle_radius, dtype=np.float32)
     formation_name = resolve_formation_name(dataset_type)
     if formation_name is not None:
-        setpoints, col_ind, offsets = _build_formation_setpoints(formation_name, start_pos, obstacles, obstacle_radius)
+        setpoints, col_ind, offsets = _build_formation_setpoints(formation_name, start_pos, obstacles, obstacle_radii)
         if setpoints is not None: return setpoints, col_ind, offsets
 
     setpoints = np.zeros((num_drones, 4))
@@ -226,47 +279,123 @@ def maybe_add_sensor_noise(global_pos, global_euler, local_lin_vel, local_ang_ve
     local_ang_vel = local_ang_vel + np.random.normal(0, noise_variance, size=3)
     return global_pos, global_euler, local_lin_vel, local_ang_vel
 
-def compute_lidar_features(global_pos, global_euler, obstacles, obstacle_radius, num_rays=16, max_range=5.0):
-    """Simulates 2D LiDAR raycasting to detect obstacles and return distance readings."""
-    obs_features = np.full(num_rays, max_range)
-    if len(obstacles) == 0:
-        return obs_features
-        
-    drone_pos = global_pos[:2]
-    drone_yaw = global_euler[2]
-    angles = np.linspace(0, 2 * np.pi, num_rays, endpoint=False) + drone_yaw
-    rays = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+def compute_apf_setpoints(
+    current_positions: np.ndarray,
+    final_setpoints: np.ndarray,
+    obstacles: np.ndarray,
+    obstacle_radii: np.ndarray,
+    attractive_gain: float,
+    repulsive_gain: float,
+    repulsion_padding: float,
+    max_step_size: float,
+    vertical_gain: float,
+):
+    if len(current_positions) == 0:
+        return np.zeros((0, 4), dtype=np.float32)
 
-    W = obstacles - drone_pos # (O, 2)
-    t = W @ rays.T # (O, 16)
-    hit_mask = t > 0
-    
-    W_sq = np.sum(W**2, axis=1)[:, None]
-    d_sq = W_sq - t**2
-    valid_hit = hit_mask & (d_sq <= obstacle_radius**2)
-    
-    if np.any(valid_hit):
-        safe_d_sq = np.clip(d_sq, 0, obstacle_radius**2)
-        hit_dists = t - np.sqrt(obstacle_radius**2 - safe_d_sq)
-        hit_dists[~valid_hit] = max_range
-        hit_dists[hit_dists <= 0] = max_range
-        min_dists = np.min(hit_dists, axis=0) # (16,)
-        obs_features = np.minimum(obs_features, min_dists)
-        
-    return obs_features
-
-def build_drone_features(drone, drone_idx, setpoint, assigned_slot_idx, naive_offset, task_type, noisy_sensors, noise_variance, formation_one_hot, obstacles, obstacle_radius, include_formation_in_state, start_pos_center):
-    state = drone.state
-    global_pos = np.array(state[3], copy=True)
-    global_euler = np.array(state[1], copy=True)
-    local_lin_vel = np.array(state[2], copy=True)
-    local_ang_vel = np.array(state[0], copy=True)
-
-    global_pos, global_euler, local_lin_vel, local_ang_vel = maybe_add_sensor_noise(
-        global_pos, global_euler, local_lin_vel, local_ang_vel, noisy_sensors, noise_variance
+    final_target_positions = np.column_stack(
+        [final_setpoints[:, 0], final_setpoints[:, 1], final_setpoints[:, 3]]
     )
 
-    obs_features = compute_lidar_features(global_pos, global_euler, obstacles, obstacle_radius)
+    attractive = final_target_positions - current_positions
+    attractive[:, :2] *= attractive_gain
+    attractive[:, 2] *= vertical_gain
+
+    repulsive_xy = np.zeros((len(current_positions), 2), dtype=np.float32)
+    if len(obstacles) > 0:
+        if obstacle_radii is None or len(obstacle_radii) == 0:
+            obstacle_radii = np.ones((len(obstacles),), dtype=np.float32)
+
+        diff = current_positions[:, None, :2] - obstacles[None, :, :]
+        dist = np.linalg.norm(diff, axis=2) + 1e-6
+        influence_radius = obstacle_radii[None, :] + repulsion_padding
+        inside_influence = dist < influence_radius
+
+        safe_dist = np.maximum(dist, 1e-3)
+        repulse_strength = repulsive_gain * (1.0 / safe_dist - 1.0 / influence_radius) / (safe_dist**2)
+        repulse_strength = np.where(inside_influence, repulse_strength, 0.0)
+
+        direction = diff / safe_dist[..., None]
+        repulsive_xy = np.sum(repulse_strength[..., None] * direction, axis=1)
+
+    total_delta = np.copy(attractive)
+    total_delta[:, :2] += repulsive_xy
+
+    norm = np.linalg.norm(total_delta, axis=1, keepdims=True)
+    scale = np.minimum(1.0, max_step_size / (norm + 1e-6))
+    bounded_delta = total_delta * scale
+    intermediate_positions = current_positions + bounded_delta
+
+    intermediate_setpoints = np.zeros_like(final_setpoints)
+    intermediate_setpoints[:, 0] = intermediate_positions[:, 0]
+    intermediate_setpoints[:, 1] = intermediate_positions[:, 1]
+    intermediate_setpoints[:, 2] = final_setpoints[:, 2]
+    intermediate_setpoints[:, 3] = intermediate_positions[:, 2]
+    return intermediate_setpoints
+
+def compute_lidar_features(global_pos, global_euler, obstacles, obstacle_radii, num_rays=16, max_range=5.0):
+    """Batched 2D LiDAR raycasting for all drones: returns (N, num_rays)."""
+    pos = np.asarray(global_pos, dtype=np.float32)
+    euler = np.asarray(global_euler, dtype=np.float32)
+    num_drones = pos.shape[0]
+
+    if num_drones == 0:
+        return np.zeros((0, num_rays), dtype=np.float32)
+
+    obs_features = np.full((num_drones, num_rays), max_range, dtype=np.float32)
+    if len(obstacles) == 0:
+        return obs_features
+
+    obs = np.asarray(obstacles, dtype=np.float32)
+    if obstacle_radii is None or len(obstacle_radii) == 0:
+        radii = np.ones((len(obs),), dtype=np.float32)
+    else:
+        radii = np.asarray(obstacle_radii, dtype=np.float32)
+
+    base_angles = np.linspace(0.0, 2.0 * np.pi, num_rays, endpoint=False, dtype=np.float32)
+    angles = euler[:, 2:3] + base_angles[None, :]
+    rays = np.stack([np.cos(angles), np.sin(angles)], axis=-1)  # (N, R, 2)
+
+    w = obs[None, :, :] - pos[:, None, :2]  # (N, O, 2)
+    t = np.einsum("noj,nrj->nor", w, rays, optimize=True)  # (N, O, R)
+    hit_mask = t > 0.0
+
+    w_sq = np.einsum("noj,noj->no", w, w, optimize=True)[:, :, None]  # (N, O, 1)
+    d_sq = w_sq - t**2  # (N, O, R)
+
+    r_sq = (radii[None, :, None]) ** 2  # (1, O, 1)
+    valid_hit = hit_mask & (d_sq <= r_sq)
+
+    if np.any(valid_hit):
+        safe_d_sq = np.clip(d_sq, 0.0, r_sq)
+        hit_dists = t - np.sqrt(np.maximum(0.0, r_sq - safe_d_sq))
+        hit_dists = np.where(valid_hit, hit_dists, max_range)
+        hit_dists = np.where(hit_dists > 0.0, hit_dists, max_range)
+        obs_features = np.minimum(obs_features, np.min(hit_dists, axis=1))
+
+    return obs_features
+
+def build_drone_features(drone, drone_idx, setpoint, assigned_slot_idx, naive_offset, task_type, noisy_sensors, noise_variance, formation_one_hot, obstacles, obstacle_radii, include_formation_in_state, start_pos_center, precomputed_state=None):
+    if precomputed_state is None:
+        state = drone.state
+        global_pos = np.array(state[3], copy=True)
+        global_euler = np.array(state[1], copy=True)
+        local_lin_vel = np.array(state[2], copy=True)
+        local_ang_vel = np.array(state[0], copy=True)
+
+        global_pos, global_euler, local_lin_vel, local_ang_vel = maybe_add_sensor_noise(
+            global_pos, global_euler, local_lin_vel, local_ang_vel, noisy_sensors, noise_variance
+        )
+
+        obs_features = compute_lidar_features(
+            global_pos[None, :], global_euler[None, :], obstacles, obstacle_radii
+        )[0]
+    else:
+        global_pos = precomputed_state["global_pos"]
+        global_euler = precomputed_state["global_euler"]
+        local_lin_vel = precomputed_state["local_lin_vel"]
+        local_ang_vel = precomputed_state["local_ang_vel"]
+        obs_features = precomputed_state["obs_features"]
 
     gnn_input_state = np.concatenate([local_lin_vel, local_ang_vel, obs_features])
     if include_formation_in_state and formation_one_hot is not None:
@@ -294,37 +423,91 @@ def build_drone_features(drone, drone_idx, setpoint, assigned_slot_idx, naive_of
 
     elif task_type in ("formation_assignment_homo", "formation_assignment_hetero"):
         y_label = np.array([assigned_slot_idx], dtype=np.float32)
+    else:
+        raise ValueError(f"Unsupported task_type: {task_type}")
 
     return gnn_input_state, y_label, drone.pwm, global_pos
 
+
 def build_edges(global_positions: np.ndarray, communication_radius: float):
-    edges = []
-    edge_attrs = []
-    num_drones = len(global_positions)
-    for i in range(num_drones):
-        for j in range(num_drones):
-            if i == j: continue
-            rel_pos = global_positions[j] - global_positions[i]
-            dist = np.linalg.norm(rel_pos)
-            if dist <= communication_radius:
-                edges.append([i, j])
-                edge_attrs.append(rel_pos)
+    pos = np.asarray(global_positions, dtype=np.float32)
+    num_drones = pos.shape[0]
+
+    if num_drones < 2:
+        return [], []
+
+    # rel[i, j] = pos[j] - pos[i] (same as old rel_pos definition)
+    rel = pos[None, :, :] - pos[:, None, :]  # shape: (N, N, 3)
+
+    # Exclude self-edges
+    not_self = ~np.eye(num_drones, dtype=bool)
+
+    if np.isinf(communication_radius):
+        mask = not_self
+    else:
+        # Squared distance matrix in C-backed NumPy ops
+        dist_sq = np.einsum("ijk,ijk->ij", rel, rel)
+        radius_sq = float(communication_radius) ** 2
+        mask = (dist_sq <= radius_sq) & not_self
+
+    src, dst = np.nonzero(mask)
+
+    edges = np.column_stack((src, dst)).tolist()
+    edge_attrs = rel[src, dst].tolist()
     return edges, edge_attrs
 
-def collect_step_data(env, active_drones, setpoints, slot_assignments, naive_offsets, task_type, noisy_sensors, noise_variance, communication_radius, formation_one_hot, obstacles, obstacle_radius, include_formation_in_state, start_pos_center):
-    episode_states, episode_targets, episode_labels, global_positions = [], [], [], []
+
+def collect_step_data(env, active_drones, setpoints, slot_assignments, naive_offsets, task_type, noisy_sensors, noise_variance, communication_radius, formation_one_hot, obstacles, obstacle_radii, include_formation_in_state, start_pos_center):
+    episode_states, episode_targets, episode_labels = [], [], []
+
+    precomputed = []
+    for drone_idx in active_drones:
+        state = env.drones[drone_idx].state
+        global_pos = np.array(state[3], copy=True)
+        global_euler = np.array(state[1], copy=True)
+        local_lin_vel = np.array(state[2], copy=True)
+        local_ang_vel = np.array(state[0], copy=True)
+        global_pos, global_euler, local_lin_vel, local_ang_vel = maybe_add_sensor_noise(
+            global_pos, global_euler, local_lin_vel, local_ang_vel, noisy_sensors, noise_variance
+        )
+        precomputed.append({
+            "global_pos": global_pos,
+            "global_euler": global_euler,
+            "local_lin_vel": local_lin_vel,
+            "local_ang_vel": local_ang_vel,
+        })
+
+    global_positions = np.asarray([entry["global_pos"] for entry in precomputed], dtype=np.float32)
+    global_eulers = np.asarray([entry["global_euler"] for entry in precomputed], dtype=np.float32)
+    obs_features_batch = compute_lidar_features(global_positions, global_eulers, obstacles, obstacle_radii)
+
     for i, drone_idx in enumerate(active_drones):
         drone = env.drones[drone_idx]
         slot_idx = slot_assignments[i]
-        gnn_input_state, gnn_input_target, motor_pwm_labels, global_pos = build_drone_features(
-            drone, drone_idx, setpoints[i], slot_idx, naive_offsets[slot_idx], task_type, noisy_sensors, noise_variance, formation_one_hot, obstacles, obstacle_radius, include_formation_in_state, start_pos_center
+        precomputed[i]["obs_features"] = obs_features_batch[i]
+
+        gnn_input_state, gnn_input_target, motor_pwm_labels, _ = build_drone_features(
+            drone,
+            drone_idx,
+            setpoints[i],
+            slot_idx,
+            naive_offsets[slot_idx],
+            task_type,
+            noisy_sensors,
+            noise_variance,
+            formation_one_hot,
+            obstacles,
+            obstacle_radii,
+            include_formation_in_state,
+            start_pos_center,
+            precomputed_state=precomputed[i],
         )
         episode_states.append(gnn_input_state)
         episode_targets.append(gnn_input_target)
         episode_labels.append(motor_pwm_labels)
-        global_positions.append(global_pos)
-    edges, edge_attrs = build_edges(np.array(global_positions), communication_radius)
-    return episode_states, episode_targets, episode_labels, edges, edge_attrs, global_positions
+
+    edges, edge_attrs = build_edges(global_positions, communication_radius)
+    return episode_states, episode_targets, episode_labels, edges, edge_attrs, global_positions.tolist()
 
 def compute_split_episode_counts(num_episodes, split_ratios):
     counts = [int(num_episodes * ratio) for ratio in split_ratios]
@@ -361,7 +544,7 @@ def save_dataset(dataset_path, all_graphs, formation_names, split_name):
     )
 
 
-def convert_history_to_graphs(raw_history, task_type, active_drones, naive_offsets, formation_id, global_episode_id, obstacles):
+def convert_history_to_graphs(raw_history, task_type, active_drones, naive_offsets, formation_id, global_episode_id, obstacles, obstacle_radii):
     """Converts raw numerical numpy histories into PyTorch Geometric graph data structures."""
     graphs = []
     num_active = len(active_drones)
@@ -394,11 +577,13 @@ def convert_history_to_graphs(raw_history, task_type, active_drones, naive_offse
             graph.step_idx = torch.tensor([step_data["step_idx"]], dtype=torch.long)
             graph.num_drones = torch.tensor([num_active], dtype=torch.long)
             graph.obstacles = torch.as_tensor(obstacles, dtype=torch.float32)
+            graph.obstacle_radii = torch.as_tensor(obstacle_radii, dtype=torch.float32)
         else:
             graph = Data(
                 x=x, target=target, y=y, edge_index=edge_index, edge_attr=edge_attr,
                 pos=torch.as_tensor(np.asarray(step_data["glob_pos"]), dtype=torch.float32),
                 obstacles=torch.as_tensor(obstacles, dtype=torch.float32),
+                obstacle_radii=torch.as_tensor(obstacle_radii, dtype=torch.float32),
                 formation_id=torch.tensor([formation_id], dtype=torch.long),
                 episode_id=torch.tensor([global_episode_id], dtype=torch.long),
                 step_idx=torch.tensor([step_data["step_idx"]], dtype=torch.long),
@@ -409,12 +594,227 @@ def convert_history_to_graphs(raw_history, task_type, active_drones, naive_offse
     return graphs
 
 
+def generate_residual_correction_sample(
+    rng: np.random.Generator,
+    num_drones: int,
+    formation_name: str,
+    xy_limit: float = 10.0,
+    altitude_range: tuple[float, float] = (0.5, 5.0),
+    num_obstacles: int = 0,
+    obstacle_radius: float = 1.0,
+    obstacle_radius_range: tuple[float, float] | None = None,
+    communication_radius: float = 10.0,
+    include_formation_in_state: bool = True,
+    formation_names: tuple = FORMATION_NAMES,
+    noisy_sensors: bool = False,
+    noise_variance: float = 0.01,
+):
+    """
+    Generate a single residual correction sample WITHOUT physics simulation.
+    Much faster for dataset generation - purely geometric computation.
+    """
+    # Sample initial positions
+    start_pos, start_orn = sample_episode_initial_conditions(
+        num_drones, rng, xy_limit=xy_limit, altitude_range=altitude_range
+    )
+    
+    # Sample obstacles
+    obstacles, obstacle_radii = sample_obstacles(
+        rng, num_obstacles, xy_limit=5.0, obstacle_radius=obstacle_radius, obstacle_radius_range=obstacle_radius_range
+    )
+    
+    # Build setpoints with obstacle avoidance
+    setpoints, col_ind, naive_offsets = build_setpoints(
+        formation_name, start_pos, start_orn, rng, obstacles, obstacle_radii, obstacle_radius
+    )
+    
+    formation_id = FORMATION_TO_ID.get(formation_name, -1)
+    start_pos_center = np.mean(start_pos[:, :2], axis=0)
+    
+    # Formation one-hot
+    formation_one_hot = None
+    if formation_id >= 0 and include_formation_in_state:
+        formation_one_hot = np.zeros(len(formation_names), dtype=np.float32)
+        formation_one_hot[formation_id] = 1.0
+    
+    # Generate state features geometrically (no physics needed)
+    ep_states = []
+    ep_targets = []
+    ep_labels = []
+    
+    for i in range(num_drones):
+        # Synthetic velocity/angular features (zero or small random for realism)
+        local_lin_vel = np.zeros(3, dtype=np.float32)
+        local_ang_vel = np.zeros(3, dtype=np.float32)
+        
+        # Add small random noise if desired (mimicking stationary drones with sensor noise)
+        if noisy_sensors:
+            local_lin_vel = np.random.normal(0, noise_variance, size=3).astype(np.float32)
+            local_ang_vel = np.random.normal(0, noise_variance, size=3).astype(np.float32)
+        
+        # LiDAR features
+        obs_features = compute_lidar_features(
+            start_pos[i:i+1], start_orn[i:i+1], obstacles, obstacle_radii
+        )[0]
+        
+        # Build node features
+        gnn_input_state = np.concatenate([local_lin_vel, local_ang_vel, obs_features])
+        if include_formation_in_state and formation_one_hot is not None:
+            gnn_input_state = np.concatenate([gnn_input_state, formation_one_hot])
+        
+        # Compute residual label
+        target_global_pos = np.array([setpoints[i, 0], setpoints[i, 1], setpoints[i, 3]])
+        # Handle case where naive_offsets might be empty (use zero offset)
+        if naive_offsets is not None and len(naive_offsets) > 0:
+            naive_offset = naive_offsets[col_ind[i]]
+        else:
+            naive_offset = np.zeros(3, dtype=np.float32)
+        naive_global_pos = np.array([
+            start_pos_center[0] + naive_offset[0],
+            start_pos_center[1] + naive_offset[1],
+            target_global_pos[2],
+        ])
+        y_label = target_global_pos - naive_global_pos
+        
+        # PWM labels (zeros for residual correction)
+        motor_pwm_labels = np.zeros(4, dtype=np.float32)
+        
+        ep_states.append(gnn_input_state)
+        ep_targets.append(y_label)
+        ep_labels.append(motor_pwm_labels)
+    
+    # Build edges
+    edges, edge_attrs = build_edges(start_pos, communication_radius)
+    
+    # Create graph
+    x = torch.as_tensor(np.asarray(ep_states), dtype=torch.float32)
+    target = torch.as_tensor(np.asarray(ep_targets), dtype=torch.float32)
+    y = torch.as_tensor(np.asarray(ep_labels), dtype=torch.float32)
+    
+    if edges:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+        edge_attr = torch.as_tensor(np.asarray(edge_attrs), dtype=torch.float32)
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        edge_attr = torch.empty((0, 3), dtype=torch.float32)
+    
+    graph = Data(
+        x=x, target=target, y=y, edge_index=edge_index, edge_attr=edge_attr,
+        pos=torch.as_tensor(start_pos, dtype=torch.float32),
+        obstacles=torch.as_tensor(obstacles, dtype=torch.float32),
+        obstacle_radii=torch.as_tensor(obstacle_radii, dtype=torch.float32),
+        formation_id=torch.tensor([formation_id], dtype=torch.long),
+        episode_id=torch.tensor([0], dtype=torch.long),
+        step_idx=torch.tensor([0], dtype=torch.long),
+        num_drones=torch.tensor([num_drones], dtype=torch.long),
+    )
+    
+    return graph, {
+        "num_drones": num_drones,
+        "formation_name": formation_name,
+        "has_obstacles": len(obstacles) > 0,
+        "max_residual_norm": float(np.max(np.linalg.norm(ep_targets, axis=1))),
+    }
+
+
+# ---------------------------------------------------------
+# FAST RESIDUAL CORRECTION GENERATOR (NO PHYSICS)
+# ---------------------------------------------------------
+def generate_residual_correction_batch(config: dict):
+    """
+    Fast batch generation of residual correction samples WITHOUT physics simulation.
+    Uses purely geometric computation for 10-100x faster dataset generation.
+    """
+    rng = np.random.default_rng(config["episode_seed"])
+    
+    graphs = []
+    stats = {"count_near_zero": 0, "count_significant": 0}
+    
+    # Generate multiple samples per episode seed for efficiency
+    samples_per_seed = config.get("residual_samples_per_seed", 10)
+    
+    for sample_idx in range(samples_per_seed):
+        # Vary parameters for diversity
+        num_drones = int(rng.integers(10, 21))
+        
+        episode_dataset_type = config["dataset_type"]
+        if episode_dataset_type in {"mixed_formations", "mixed", "formations"}:
+            formation_name = str(rng.choice(config["mixed_formation_types"]))
+        else:
+            formation_name = resolve_formation_name(episode_dataset_type)
+            if formation_name is None:
+                formation_name = str(rng.choice(config["mixed_formation_types"]))
+        
+        # Vary obstacle count
+        num_obs_conf = config["num_obstacles"]
+        if isinstance(num_obs_conf, (tuple, list)):
+            current_num_obstacles = int(rng.integers(num_obs_conf[0], num_obs_conf[1] + 1))
+        else:
+            current_num_obstacles = num_obs_conf
+        
+        xy_limit = config["base_xy_limit"] * config["split_spread_scale"]
+        
+        graph, sample_stats = generate_residual_correction_sample(
+            rng=rng,
+            num_drones=num_drones,
+            formation_name=formation_name,
+            xy_limit=xy_limit,
+            altitude_range=config["altitude_range"],
+            num_obstacles=current_num_obstacles,
+            obstacle_radius=config["obstacle_radius"],
+            obstacle_radius_range=config.get("obstacle_radius_range"),
+            communication_radius=config["communication_radius"],
+            include_formation_in_state=config["include_formation_in_state"],
+            noisy_sensors=config["noisy_sensors"],
+            noise_variance=config["noise_variance"],
+        )
+        
+        # Apply class balancing to avoid too many near-zero residuals
+        is_near_zero = sample_stats["max_residual_norm"] < config["residual_dropout_threshold"]
+        
+        if is_near_zero:
+            total_potential = stats["count_near_zero"] + stats["count_significant"] + 1
+            if total_potential > 10 and (stats["count_near_zero"] + 1) / total_potential > config["residual_balance_ratio"]:
+                continue  # Skip this sample to maintain balance
+            stats["count_near_zero"] += 1
+        else:
+            stats["count_significant"] += 1
+        
+        graphs.append(graph)
+    
+    # Save graphs
+    temp_file = os.path.join(config["temp_dir"], f"ep_{config['global_episode_id']}.pt")
+    torch.save(graphs, temp_file)
+    
+    episode_record = {
+        "episode_id": config["global_episode_id"],
+        "split": config["split_name"],
+        "split_episode_idx": config["split_episode_idx"],
+        "episode_seed": config["episode_seed"],
+        "num_drones": len(graphs),  # Number of samples generated
+        "episode_dataset_type": config["dataset_type"],
+        "formation_name": "mixed",
+        "initial_xy_limit": config["base_xy_limit"] * config["split_spread_scale"],
+        "initial_xy_radius": 0.0,
+        "total_steps": samples_per_seed,
+        "saved_steps": len(graphs),
+        "converged": False,
+    }
+    
+    return config["split_name"], temp_file, stats["count_near_zero"], stats["count_significant"], episode_record
+
+
 # ---------------------------------------------------------
 # MULTIPROCESSING WORKER
 # ---------------------------------------------------------
 def simulate_episode(config: dict):
     """Worker function to simulate a complete episode logic and return captured graphs."""
     
+    # Use fast geometric generation for residual correction (no physics simulation)
+    if config["task_type"] == "residual_correction":
+        return generate_residual_correction_batch(config)
+    
+    # Physics-based simulation for other task types
     rng = np.random.default_rng(config["episode_seed"])
     num_drones = int(rng.integers(10, 21))
     
@@ -433,15 +833,38 @@ def simulate_episode(config: dict):
     else:
         current_num_obstacles = num_obs_conf
 
-    obstacles = sample_obstacles(rng, current_num_obstacles, xy_limit=5.0)
+    obstacles, obstacle_radii = sample_obstacles(
+        rng,
+        current_num_obstacles,
+        xy_limit=5.0,
+        obstacle_radius=config["obstacle_radius"],
+        obstacle_radius_range=config.get("obstacle_radius_range"),
+    )
 
     # Graphical MUST be false for parallel processes
-    env = create_aviary(start_pos, start_orn, config["environmental_wind"], obstacles, config["obstacle_radius"], False)
-    setpoints, col_ind, naive_offsets = build_setpoints(episode_dataset_type, start_pos, start_orn, rng, obstacles, config["obstacle_radius"])
+    env = create_aviary(
+        start_pos,
+        start_orn,
+        config["environmental_wind"],
+        obstacles,
+        obstacle_radii,
+        config["obstacle_radius"],
+        False,
+    )
+    setpoints, col_ind, naive_offsets = build_setpoints(
+        episode_dataset_type,
+        start_pos,
+        start_orn,
+        rng,
+        obstacles,
+        obstacle_radii,
+        config["obstacle_radius"],
+    )
     
     active_drones = list(range(num_drones))
     formation_name = resolve_formation_name(episode_dataset_type)
     formation_id = FORMATION_TO_ID[formation_name] if formation_name else -1
+    start_pos_center = np.mean(start_pos[:, :2], axis=0)
 
     formation_one_hot = None
     if formation_id >= 0:
@@ -461,8 +884,11 @@ def simulate_episode(config: dict):
 
     max_steps = config["max_steps"]
     task_type = config["task_type"]
+    is_converged = False
+    steps_taken = 0
 
     for step_idx in range(max_steps):
+        steps_taken = step_idx + 1
         steps_since_last_event += 1
 
         should_inject_failure = (config["inject_failures"] and not failure_injected_this_episode and step_idx >= max_steps // 2)
@@ -470,7 +896,15 @@ def simulate_episode(config: dict):
             failed_drone = active_drones.pop()
             env.drones[failed_drone].set_mode(0)
             active_start_pos = np.array([env.drones[idx].state[3] for idx in active_drones])
-            setpoints, col_ind, naive_offsets = build_setpoints(episode_dataset_type, active_start_pos, start_orn[: len(active_drones)], rng, obstacles, config["obstacle_radius"])
+            setpoints, col_ind, naive_offsets = build_setpoints(
+                episode_dataset_type,
+                active_start_pos,
+                start_orn[: len(active_drones)],
+                rng,
+                obstacles,
+                obstacle_radii,
+                config["obstacle_radius"],
+            )
             for i, drone_idx in enumerate(active_drones):
                 env.drones[drone_idx].set_mode(7)
                 env.set_setpoint(drone_idx, setpoints[i])
@@ -479,16 +913,44 @@ def simulate_episode(config: dict):
             already_converged_for_segment = False
 
         if config["dynamic_formation"] and step_idx > 0 and step_idx % 100 == 0:
-            next_shape = str(rng.choice(tuple(set(FORMATION_NAMES) - {formation_name})))
+            candidate_shapes = tuple(shape for shape in FORMATION_NAMES if shape != formation_name)
+            if len(candidate_shapes) == 0:
+                candidate_shapes = FORMATION_NAMES
+            next_shape = str(rng.choice(candidate_shapes))
             formation_name = next_shape
             formation_id = FORMATION_TO_ID[formation_name]
             formation_one_hot = np.zeros(len(FORMATION_NAMES), dtype=np.float32)
             formation_one_hot[formation_id] = 1.0
             active_start_pos = np.array([env.drones[idx].state[3] for idx in active_drones])
-            setpoints, col_ind, naive_offsets = build_setpoints(formation_name, active_start_pos, start_orn[: len(active_drones)], rng, obstacles, config["obstacle_radius"])
+            setpoints, col_ind, naive_offsets = build_setpoints(
+                formation_name,
+                active_start_pos,
+                start_orn[: len(active_drones)],
+                rng,
+                obstacles,
+                obstacle_radii,
+                config["obstacle_radius"],
+            )
             for i, drone_idx in enumerate(active_drones): env.set_setpoint(drone_idx, setpoints[i])
             steps_since_last_event = 0
             already_converged_for_segment = False
+
+        command_setpoints = setpoints
+        if task_type == "setpoint_prediction" and config.get("apf_enabled", True):
+            current_positions = np.array([env.drones[idx].state[3] for idx in active_drones], dtype=np.float32)
+            command_setpoints = compute_apf_setpoints(
+                current_positions=current_positions,
+                final_setpoints=setpoints,
+                obstacles=obstacles,
+                obstacle_radii=obstacle_radii,
+                attractive_gain=config.get("apf_attractive_gain", 0.8),
+                repulsive_gain=config.get("apf_repulsive_gain", 1.2),
+                repulsion_padding=config.get("apf_repulsion_padding", 2.5),
+                max_step_size=config.get("apf_max_step_size", 0.35),
+                vertical_gain=config.get("apf_vertical_gain", 0.5),
+            )
+            for i, drone_idx in enumerate(active_drones):
+                env.set_setpoint(drone_idx, command_setpoints[i])
 
         is_converged = False
         if config["conv_stopping"] and steps_since_last_event > 50:
@@ -510,22 +972,26 @@ def simulate_episode(config: dict):
 
         if is_converged or should_sample_step(step_idx, max_steps, config["tapered_sampling"], config["dense_sampling_steps"], config["mid_sampling_steps"], config["mid_step_stride"], config["late_step_stride"]):
             if can_stop_episode or should_sample_step(step_idx, max_steps, config["tapered_sampling"], config["dense_sampling_steps"], config["mid_sampling_steps"], config["mid_step_stride"], config["late_step_stride"]):
+                label_setpoints = command_setpoints if task_type == "setpoint_prediction" else setpoints
                 
                 ep_states, ep_targets, ep_labels, edges, edge_attrs, glob_pos = collect_step_data(
-                    env, active_drones, setpoints, col_ind, naive_offsets, task_type, config["noisy_sensors"], config["noise_variance"], config["communication_radius"], formation_one_hot, obstacles, config["obstacle_radius"], config["include_formation_in_state"], np.mean(start_pos[:, :2], axis=0)
+                    env,
+                    active_drones,
+                    label_setpoints,
+                    col_ind,
+                    naive_offsets,
+                    task_type,
+                    config["noisy_sensors"],
+                    config["noise_variance"],
+                    config["communication_radius"],
+                    formation_one_hot,
+                    obstacles,
+                    obstacle_radii,
+                    config["include_formation_in_state"],
+                    start_pos_center,
                 )
 
                 should_skip_step = False
-                is_near_zero = False
-
-                if task_type == "residual_correction":
-                    max_residual_norm = np.max(np.linalg.norm(ep_targets, axis=1))
-                    is_near_zero = (max_residual_norm < config["residual_dropout_threshold"])
-                    if is_near_zero:
-                        # Since we simulate globally inside config loop, we track running total locally per episode and extrapolate roughly
-                        total_potential = count_near_zero + count_significant + 1
-                        if total_potential > 10 and (count_near_zero + 1) / total_potential > config["residual_balance_ratio"]:
-                            should_skip_step = True
 
                 if not should_skip_step:
                     raw_history.append({
@@ -538,10 +1004,6 @@ def simulate_episode(config: dict):
                         "step_idx": step_idx,
                     })
                     saved_steps += 1
-                    
-                    if task_type == "residual_correction":
-                        if is_near_zero: count_near_zero += 1
-                        else: count_significant += 1
 
         env.step()
         if can_stop_episode: break
@@ -557,6 +1019,7 @@ def simulate_episode(config: dict):
         formation_id=formation_id,
         global_episode_id=config["global_episode_id"],
         obstacles=obstacles,
+        obstacle_radii=obstacle_radii,
     )
     
     # Save the generated graphs for this episode to a temporary file on disk (bypassing IPC serialization bottlenecks)
@@ -576,7 +1039,7 @@ def simulate_episode(config: dict):
         "formation_name": formation_name,
         "initial_xy_limit": xy_limit,
         "initial_xy_radius": initial_xy_radius,
-        "total_steps": step_idx + 1,
+        "total_steps": steps_taken,
         "saved_steps": saved_steps,
         "converged": bool(is_converged),
     }
@@ -600,8 +1063,10 @@ def generate_dataset_parallel(
     ] = "setpoint_prediction",
     num_obstacles: int | tuple[int, int] = 0,
     obstacle_radius: float = 1.0,
+    obstacle_radius_range: tuple[float, float] | None = None,
     residual_balance_ratio: float = 0.5,
     residual_dropout_threshold: float = 0.1,
+    residual_samples_per_seed: int = 10,
     inject_failures: bool = False,
     dynamic_formation: bool = False,
     noisy_sensors: bool = False,
@@ -623,6 +1088,12 @@ def generate_dataset_parallel(
     late_step_stride: int = 5,
     conv_stopping: bool = True,
     conv_threshold: float = 0.2,
+    apf_enabled: bool = True,
+    apf_attractive_gain: float = 0.8,
+    apf_repulsive_gain: float = 1.2,
+    apf_repulsion_padding: float = 2.5,
+    apf_max_step_size: float = 0.35,
+    apf_vertical_gain: float = 0.5,
 ) -> tuple[dict[str, str], str]:
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -660,8 +1131,10 @@ def generate_dataset_parallel(
                 "task_type": task_type,
                 "num_obstacles": num_obstacles,
                 "obstacle_radius": obstacle_radius,
+                "obstacle_radius_range": obstacle_radius_range,
                 "residual_balance_ratio": residual_balance_ratio,
                 "residual_dropout_threshold": residual_dropout_threshold,
+                "residual_samples_per_seed": residual_samples_per_seed,
                 "inject_failures": inject_failures,
                 "dynamic_formation": dynamic_formation,
                 "noisy_sensors": noisy_sensors,
@@ -680,6 +1153,12 @@ def generate_dataset_parallel(
                 "late_step_stride": late_step_stride,
                 "conv_stopping": conv_stopping,
                 "conv_threshold": conv_threshold,
+                "apf_enabled": apf_enabled,
+                "apf_attractive_gain": apf_attractive_gain,
+                "apf_repulsive_gain": apf_repulsive_gain,
+                "apf_repulsion_padding": apf_repulsion_padding,
+                "apf_max_step_size": apf_max_step_size,
+                "apf_vertical_gain": apf_vertical_gain,
                 "temp_dir": temp_dir,
             })
             global_episode_id += 1
@@ -744,6 +1223,7 @@ def generate_dataset_parallel(
             "max_steps": max_steps,
             "num_obstacles": num_obstacles,
             "obstacle_radius": obstacle_radius,
+            "obstacle_radius_range": list(obstacle_radius_range) if obstacle_radius_range is not None else None,
             "inject_failures": inject_failures,
             "dynamic_formation": dynamic_formation,
             "noisy_sensors": noisy_sensors,
@@ -767,6 +1247,13 @@ def generate_dataset_parallel(
             "conv_threshold": conv_threshold,
             "residual_balance_ratio": residual_balance_ratio,
             "residual_dropout_threshold": residual_dropout_threshold,
+            "residual_samples_per_seed": residual_samples_per_seed,
+            "apf_enabled": apf_enabled,
+            "apf_attractive_gain": apf_attractive_gain,
+            "apf_repulsive_gain": apf_repulsive_gain,
+            "apf_repulsion_padding": apf_repulsion_padding,
+            "apf_max_step_size": apf_max_step_size,
+            "apf_vertical_gain": apf_vertical_gain,
         },
         "split_summary": split_summaries,
         # sort records to keep order consistent
@@ -780,8 +1267,8 @@ def generate_dataset_parallel(
 if __name__ == "__main__":
     # Test execution
     generated_files, metadata_path = generate_dataset_parallel(
-        num_workers=1,
-        dataset_name="set_point_prediction_dataset_parallel",
+        num_workers=6,
+        dataset_name="set_point_prediction_dataset_parallel_apf_600",
         dataset_type="mixed_formations",
         task_type="setpoint_prediction",
         noisy_sensors=False,
@@ -790,15 +1277,22 @@ if __name__ == "__main__":
         inject_failures=False,
         communication_radius=10.0,
         include_formation_in_state=True,
-        max_steps=1200,
-        num_episodes=50,
+        max_steps=3000,
+        num_episodes=600,
+        residual_samples_per_seed=50,  # Generate 50 samples per seed (500 total samples)
         tapered_sampling=True,
         conv_stopping=True,
         conv_threshold=0.2,
         num_obstacles=(0, 10),  # Random obstacles between 0 and 10
-        residual_balance_ratio=0.5,  # Aim for 50/50 split between near-zero and significant residuals
-        residual_dropout_threshold=0.1,  # 10cm threshold
         seed=12345,
+        obstacle_radius_range=(0.4, 1.8),
+        apf_enabled=True,
+        apf_attractive_gain=1.0,
+        apf_repulsive_gain=1.2,
+        apf_repulsion_padding=0.8,
+        apf_max_step_size=1.5,
+        apf_vertical_gain=1.0,
+        residual_balance_ratio=0.5,
     )
     print(f"Done. Outputs: {generated_files}")
-#python data_collection_parallel.py | grep -v 'argv\\[0\\]='
+# python data_collection_parallel.py | grep -v 'argv\\[0\\]='
