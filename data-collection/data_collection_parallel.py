@@ -1,17 +1,17 @@
-import cProfile
 import io
 import json
 import os
 import time
 import shutil
 from typing import Literal
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 
 import numpy as np
 import pybullet as p
 import torch
 from safetensors.torch import load_file, save_file
+import gc
 from scipy.optimize import linear_sum_assignment
 from torch_geometric.data import Data, HeteroData, InMemoryDataset
 
@@ -657,30 +657,98 @@ def build_episode_seed(seed, split_name, split_episode_idx):
     if seed is None: return None
     return int(seed + SPLIT_SEED_OFFSETS[split_name] + split_episode_idx)
 
+
+def distribute_episodes_to_workers(
+    num_workers,
+    split_episode_counts,
+    seed,
+    validation_spread_scale,
+    test_spread_scale,
+    worker_batch_size: int | None = None,
+    **common_kwargs,
+):
+    """Distribute episodes into tasks.
+
+    - If worker_batch_size is provided (>0), each task gets at most that many episodes.
+    - Otherwise, create roughly num_workers tasks per split.
+    """
+    worker_tasks = []
+    worker_id = 0
+    next_global_episode_id = 0
+
+    for split_name in SPLIT_NAMES:
+        count = split_episode_counts[split_name]
+        spread_scale = resolve_split_spread_scale(
+            split_name, validation_spread_scale, test_spread_scale
+        )
+
+        if worker_batch_size is not None and worker_batch_size > 0:
+            chunk_size = worker_batch_size
+        else:
+            chunk_size = max(1, (count + num_workers - 1) // num_workers)
+
+        start_episode_idx = 0
+        while start_episode_idx < count:
+            num_episodes_for_worker = min(chunk_size, count - start_episode_idx)
+
+            episode_configs = []
+            for local_idx in range(num_episodes_for_worker):
+                split_episode_idx = start_episode_idx + local_idx
+                ep_seed = build_episode_seed(seed, split_name, split_episode_idx)
+                episode_configs.append(
+                    {
+                        "split_episode_idx": split_episode_idx,
+                        "episode_seed": ep_seed,
+                        "global_episode_id": next_global_episode_id,
+                    }
+                )
+                next_global_episode_id += 1
+
+            worker_tasks.append(
+                {
+                    "worker_id": worker_id,
+                    "split_name": split_name,
+                    "spread_scale": spread_scale,
+                    "episode_configs": episode_configs,
+                    "num_episodes": num_episodes_for_worker,
+                    **common_kwargs,
+                }
+            )
+
+            worker_id += 1
+            start_episode_idx += num_episodes_for_worker
+
+    return worker_tasks
+
+
 def write_dataset_metadata(metadata_path, metadata):
     with open(metadata_path, "w", encoding="ascii") as metadata_file:
         json.dump(metadata, metadata_file, indent=2)
         metadata_file.write("\n")
 
-def save_object_safetensors(file_path: str, payload_obj) -> None:
-    """Persist an arbitrary Python object inside a safetensors file.
 
-    The object is first serialized with torch.save to bytes and then stored
-    as a uint8 tensor under key 'payload'.
-    """
+def save_object_safetensors(file_path: str, payload_obj) -> None:
+    """Persist an arbitrary Python object inside a safetensors file."""
     buffer = io.BytesIO()
     torch.save(payload_obj, buffer)
     byte_arr = np.frombuffer(buffer.getvalue(), dtype=np.uint8).copy()
     tensor_payload = torch.from_numpy(byte_arr)
     save_file({"payload": tensor_payload}, file_path)
 
+
+
 def load_object_safetensors(file_path: str):
-    """Load an arbitrary Python object previously saved with save_object_safetensors."""
+    """Memory-safe loader that immediately frees byte references."""
     tensors = load_file(file_path)
-    if "payload" not in tensors:
-        raise ValueError(f"Invalid safetensors payload file: {file_path}")
-    payload_bytes = tensors["payload"].cpu().numpy().tobytes()
+    payload = tensors["payload"]
+    payload_bytes = payload.cpu().numpy().tobytes()
+    del tensors
+    del payload
+    gc.collect()
     return torch.load(io.BytesIO(payload_bytes), weights_only=False)
+
+
+    
 
 def save_dataset(dataset_path, all_graphs, formation_names, split_name):
     data, slices = InMemoryDataset.collate(all_graphs)
@@ -865,101 +933,85 @@ def generate_residual_correction_sample(
 
 
 # ---------------------------------------------------------
-# FAST RESIDUAL CORRECTION GENERATOR (NO PHYSICS)
-# ---------------------------------------------------------
-def generate_residual_correction_batch(config: dict):
-    """
-    Fast batch generation of residual correction samples WITHOUT physics simulation.
-    Uses purely geometric computation for 10-100x faster dataset generation.
-    """
-    rng = np.random.default_rng(config["episode_seed"])
-    
-    graphs = []
-    stats = {"count_near_zero": 0, "count_significant": 0}
-    
-    # Generate multiple samples per episode seed for efficiency
-    samples_per_seed = config.get("residual_samples_per_seed", 10)
-    
-    for sample_idx in range(samples_per_seed):
-        # Vary parameters for diversity
-        num_drones = int(rng.integers(10, 21))
-        
-        episode_dataset_type = config["dataset_type"]
-        if episode_dataset_type in {"mixed_formations", "mixed", "formations"}:
-            formation_name = str(rng.choice(config["mixed_formation_types"]))
-        else:
-            formation_name = resolve_formation_name(episode_dataset_type)
-            if formation_name is None:
-                formation_name = str(rng.choice(config["mixed_formation_types"]))
-        
-        # Vary obstacle count
-        num_obs_conf = config["num_obstacles"]
-        if isinstance(num_obs_conf, (tuple, list)):
-            current_num_obstacles = int(rng.integers(num_obs_conf[0], num_obs_conf[1] + 1))
-        else:
-            current_num_obstacles = num_obs_conf
-        
-        xy_limit = config["base_xy_limit"] * config["split_spread_scale"]
-        
-        graph, sample_stats = generate_residual_correction_sample(
-            rng=rng,
-            num_drones=num_drones,
-            formation_name=formation_name,
-            xy_limit=xy_limit,
-            altitude_range=config["altitude_range"],
-            num_obstacles=current_num_obstacles,
-            obstacle_radius=config["obstacle_radius"],
-            obstacle_radius_range=config.get("obstacle_radius_range"),
-            communication_radius=config["communication_radius"],
-            include_formation_in_state=config["include_formation_in_state"],
-            noisy_sensors=config["noisy_sensors"],
-            noise_variance=config["noise_variance"],
-        )
-        
-        # Apply class balancing to avoid too many near-zero residuals
-        is_near_zero = sample_stats["max_residual_norm"] < config["residual_dropout_threshold"]
-        
-        if is_near_zero:
-            total_potential = stats["count_near_zero"] + stats["count_significant"] + 1
-            if total_potential > 10 and (stats["count_near_zero"] + 1) / total_potential > config["residual_balance_ratio"]:
-                continue  # Skip this sample to maintain balance
-            stats["count_near_zero"] += 1
-        else:
-            stats["count_significant"] += 1
-        
-        graphs.append(graph)
-    
-    # Save graphs
-    temp_file = os.path.join(config["temp_dir"], f"ep_{config['global_episode_id']}.safetensors")
-    save_object_safetensors(temp_file, graphs)
-    
-    episode_record = {
-        "episode_id": config["global_episode_id"],
-        "split": config["split_name"],
-        "split_episode_idx": config["split_episode_idx"],
-        "episode_seed": config["episode_seed"],
-        "num_drones": len(graphs),  # Number of samples generated
-        "episode_dataset_type": config["dataset_type"],
-        "formation_name": "mixed",
-        "initial_xy_limit": config["base_xy_limit"] * config["split_spread_scale"],
-        "initial_xy_radius": 0.0,
-        "total_steps": samples_per_seed,
-        "saved_steps": len(graphs),
-        "converged": False,
-    }
-    
-    return config["split_name"], temp_file, stats["count_near_zero"], stats["count_significant"], episode_record
-
-
-# ---------------------------------------------------------
 # MULTIPROCESSING WORKER
 # ---------------------------------------------------------
 def simulate_episode(config: dict):
-    """Worker function to simulate a complete episode logic and return captured graphs."""
+    """Worker function to simulate a single episode (legacy, kept for compatibility).
+    Note: For batch processing, use simulate_episode_batch instead.
+    """
     
     # Use fast geometric generation for residual correction (no physics simulation)
     if config["task_type"] == "residual_correction":
-        return generate_residual_correction_batch(config)
+        # Inline residual correction generation (migrated from generate_residual_correction_batch)
+        rng = np.random.default_rng(config["episode_seed"])
+        graphs = []
+        stats = {"count_near_zero": 0, "count_significant": 0}
+        samples_per_seed = config.get("residual_samples_per_seed", 10)
+        
+        for sample_idx in range(samples_per_seed):
+            num_drones = int(rng.integers(10, 21))
+            episode_dataset_type = config["dataset_type"]
+            if episode_dataset_type in {"mixed_formations", "mixed", "formations"}:
+                formation_name = str(rng.choice(config["mixed_formation_types"]))
+            else:
+                formation_name = resolve_formation_name(episode_dataset_type)
+                if formation_name is None:
+                    formation_name = str(rng.choice(config["mixed_formation_types"]))
+            
+            num_obs_conf = config["num_obstacles"]
+            if isinstance(num_obs_conf, (tuple, list)):
+                current_num_obstacles = int(rng.integers(num_obs_conf[0], num_obs_conf[1] + 1))
+            else:
+                current_num_obstacles = num_obs_conf
+            
+            xy_limit = config["base_xy_limit"] * config["split_spread_scale"]
+            
+            graph, sample_stats = generate_residual_correction_sample(
+                rng=rng,
+                num_drones=num_drones,
+                formation_name=formation_name,
+                xy_limit=xy_limit,
+                altitude_range=config["altitude_range"],
+                num_obstacles=current_num_obstacles,
+                obstacle_radius=config["obstacle_radius"],
+                obstacle_radius_range=config.get("obstacle_radius_range"),
+                communication_radius=config["communication_radius"],
+                include_formation_in_state=config["include_formation_in_state"],
+                noisy_sensors=config["noisy_sensors"],
+                noise_variance=config["noise_variance"],
+            )
+            
+            is_near_zero = sample_stats["max_residual_norm"] < config["residual_dropout_threshold"]
+            if is_near_zero:
+                total_potential = stats["count_near_zero"] + stats["count_significant"] + 1
+                if total_potential > 10 and (stats["count_near_zero"] + 1) / total_potential > config["residual_balance_ratio"]:
+                    continue
+                stats["count_near_zero"] += 1
+            else:
+                stats["count_significant"] += 1
+            
+            graphs.append(graph)
+        len_graphs = len(graphs)
+        temp_file = os.path.join(config["temp_dir"], f"ep_{config['global_episode_id']}.safetensors")
+        save_object_safetensors(temp_file, graphs)   # write immediately
+        del graphs 
+        
+        episode_record = {
+            "episode_id": config["global_episode_id"],
+            "split": config["split_name"],
+            "split_episode_idx": config["split_episode_idx"],
+            "episode_seed": config["episode_seed"],
+            "num_drones": len_graphs,
+            "episode_dataset_type": config["dataset_type"],
+            "formation_name": "mixed",
+            "initial_xy_limit": config["base_xy_limit"] * config["split_spread_scale"],
+            "initial_xy_radius": 0.0,
+            "total_steps": samples_per_seed,
+            "saved_steps": len_graphs,
+            "converged": False,
+        }
+        
+        return config["split_name"], temp_file, stats["count_near_zero"], stats["count_significant"], episode_record
     
     # Physics-based simulation for other task types
     rng = np.random.default_rng(config["episode_seed"])
@@ -1194,10 +1246,284 @@ def simulate_episode(config: dict):
 
     return config["split_name"], temp_file, count_near_zero, count_significant, episode_record
 
+
+
+def save_dataset_shard(dataset_path, all_graphs, formation_names, split_name):
+    data, slices = InMemoryDataset.collate(all_graphs)
+    save_object_safetensors(
+        dataset_path,
+        {"data": data, "slices": slices, "formation_names": formation_names, "split_name": split_name},
+    )
+
+def simulate_worker_chunk(config: dict):
+    """Worker function to simulate a batch of episodes and save a dataset shard directly."""
+    split_name = config["split_name"]
+    episode_configs = config["episode_configs"]
+    task_type = config["task_type"]
+    chunk_graphs = []
+    episode_records = []
+    total_count_near_zero = 0
+    total_count_significant = 0
+
+    for ep_idx, ep_config in enumerate(episode_configs):
+        single_config = {
+            **config,
+            "split_name": split_name,
+            "split_episode_idx": ep_config["split_episode_idx"],
+            "episode_seed": ep_config["episode_seed"],
+            "global_episode_id": ep_config["global_episode_id"],
+            "split_spread_scale": config["spread_scale"],
+        }
+        if task_type == "residual_correction":
+            rng = np.random.default_rng(ep_config["episode_seed"])
+            samples_per_seed = config.get("residual_samples_per_seed", 10)
+            episode_saved_steps = 0
+            for sample_idx in range(samples_per_seed):
+                graph, sample_stats = generate_residual_correction_sample(
+                    rng=rng,
+                    num_drones=int(rng.integers(10, 21)),
+                    formation_name=str(rng.choice(config["mixed_formation_types"])) if config["dataset_type"] in {"mixed_formations", "mixed", "formations"} else resolve_formation_name(config["dataset_type"]) or str(rng.choice(config["mixed_formation_types"])),
+                    xy_limit=config["base_xy_limit"] * config["spread_scale"],
+                    altitude_range=config["altitude_range"],
+                    num_obstacles=int(rng.integers(*config["num_obstacles"])) if isinstance(config["num_obstacles"], (tuple, list)) else config["num_obstacles"],
+                    obstacle_radius=config["obstacle_radius"],
+                    obstacle_radius_range=config.get("obstacle_radius_range"),
+                    communication_radius=config["communication_radius"],
+                    include_formation_in_state=config["include_formation_in_state"],
+                    noisy_sensors=config["noisy_sensors"],
+                    noise_variance=config["noise_variance"],
+                )
+                is_near_zero = sample_stats["max_residual_norm"] < config["residual_dropout_threshold"]
+                if is_near_zero:
+                    total_potential = total_count_near_zero + total_count_significant + 1
+                    if total_potential > 10 and (total_count_near_zero + 1) / total_potential > config["residual_balance_ratio"]:
+                        continue
+                    total_count_near_zero += 1
+                else:
+                    total_count_significant += 1
+                graph.episode_id = torch.tensor([ep_config["global_episode_id"]], dtype=torch.long)
+                chunk_graphs.append(graph)
+                episode_saved_steps += 1
+            episode_records.append({
+                "episode_id": ep_config["global_episode_id"],
+                "split": split_name,
+                "split_episode_idx": ep_config["split_episode_idx"],
+                "episode_seed": ep_config["episode_seed"],
+                "num_drones": episode_saved_steps,
+                "episode_dataset_type": config["dataset_type"],
+                "formation_name": "mixed",
+                "initial_xy_limit": config["base_xy_limit"] * config["spread_scale"],
+                "initial_xy_radius": 0.0,
+                "total_steps": samples_per_seed,
+                "saved_steps": episode_saved_steps,
+                "converged": False,
+            })
+        else:
+            rng = np.random.default_rng(ep_config["episode_seed"])
+            num_drones = int(rng.integers(10, 21))
+            episode_dataset_type = config["dataset_type"]
+            if episode_dataset_type in {"mixed_formations", "mixed", "formations"}:
+                episode_dataset_type = str(rng.choice(config["mixed_formation_types"]))
+            xy_limit = config["base_xy_limit"] * config["spread_scale"]
+            start_pos, start_orn = sample_episode_initial_conditions(
+                num_drones, rng, xy_limit=xy_limit, altitude_range=config["altitude_range"]
+            )
+            num_obs_conf = config["num_obstacles"]
+            if isinstance(num_obs_conf, tuple) or isinstance(num_obs_conf, list):
+                current_num_obstacles = int(rng.integers(num_obs_conf[0], num_obs_conf[1] + 1))
+            else:
+                current_num_obstacles = num_obs_conf
+            obstacles, obstacle_radii = sample_obstacles(
+                rng,
+                current_num_obstacles,
+                xy_limit=5.0,
+                z_limit=config["altitude_range"],
+                obstacle_radius=config["obstacle_radius"],
+                obstacle_radius_range=config.get("obstacle_radius_range"),
+            )
+            env = create_aviary(
+                start_pos,
+                start_orn,
+                config["environmental_wind"],
+                obstacles,
+                obstacle_radii,
+                config["obstacle_radius"],
+                False,
+            )
+            setpoints, col_ind, naive_offsets = build_setpoints(
+                episode_dataset_type,
+                start_pos,
+                start_orn,
+                rng,
+                obstacles,
+                obstacle_radii,
+                config["obstacle_radius"],
+            )
+            active_drones = list(range(num_drones))
+            formation_name = resolve_formation_name(episode_dataset_type)
+            formation_id = FORMATION_TO_ID[formation_name] if formation_name else -1
+            start_pos_center = np.mean(start_pos[:, :2], axis=0)
+            formation_one_hot = None
+            if formation_id >= 0:
+                formation_one_hot = np.zeros(len(FORMATION_NAMES), dtype=np.float32)
+                formation_one_hot[formation_id] = 1.0
+            for i, drone_idx in enumerate(active_drones):
+                env.set_setpoint(drone_idx, setpoints[i])
+            saved_steps = 0
+            steps_since_last_event = 0
+            failure_injected_this_episode = False
+            already_converged_for_segment = False
+            raw_history = []
+            max_steps = config["max_steps"]
+            is_converged = False
+            steps_taken = 0
+            for step_idx in range(max_steps):
+                steps_taken = step_idx + 1
+                steps_since_last_event += 1
+                should_inject_failure = (config["inject_failures"] and not failure_injected_this_episode and step_idx >= max_steps // 2)
+                if should_inject_failure and len(active_drones) > 2:
+                    failed_drone = active_drones.pop()
+                    env.drones[failed_drone].set_mode(0)
+                    active_start_pos = np.array([env.drones[idx].state[3] for idx in active_drones])
+                    setpoints, col_ind, naive_offsets = build_setpoints(
+                        episode_dataset_type,
+                        active_start_pos,
+                        start_orn[: len(active_drones)],
+                        rng,
+                        obstacles,
+                        obstacle_radii,
+                        config["obstacle_radius"],
+                    )
+                    for i, drone_idx in enumerate(active_drones):
+                        env.drones[drone_idx].set_mode(7)
+                        env.set_setpoint(drone_idx, setpoints[i])
+                    failure_injected_this_episode = True
+                    steps_since_last_event = 0
+                    already_converged_for_segment = False
+                if config["dynamic_formation"] and step_idx > 0 and step_idx % 100 == 0:
+                    candidate_shapes = tuple(shape for shape in FORMATION_NAMES if shape != formation_name)
+                    if len(candidate_shapes) == 0:
+                        candidate_shapes = FORMATION_NAMES
+                    next_shape = str(rng.choice(candidate_shapes))
+                    formation_name = next_shape
+                    formation_id = FORMATION_TO_ID[formation_name]
+                    formation_one_hot = np.zeros(len(FORMATION_NAMES), dtype=np.float32)
+                    formation_one_hot[formation_id] = 1.0
+                    active_start_pos = np.array([env.drones[idx].state[3] for idx in active_drones])
+                    setpoints, col_ind, naive_offsets = build_setpoints(
+                        formation_name,
+                        active_start_pos,
+                        start_orn[: len(active_drones)],
+                        rng,
+                        obstacles,
+                        obstacle_radii,
+                        config["obstacle_radius"],
+                    )
+                    for i, drone_idx in enumerate(active_drones): env.set_setpoint(drone_idx, setpoints[i])
+                    steps_since_last_event = 0
+                    already_converged_for_segment = False
+                command_setpoints = setpoints
+                if task_type == "setpoint_prediction" and config.get("apf_enabled", True):
+                    current_positions = np.array([env.drones[idx].state[3] for idx in active_drones], dtype=np.float32)
+                    command_setpoints = compute_apf_setpoints(
+                        current_positions=current_positions,
+                        final_setpoints=setpoints,
+                        obstacles=obstacles,
+                        obstacle_radii=obstacle_radii,
+                        attractive_gain=config.get("apf_attractive_gain", 0.8),
+                        repulsive_gain=config.get("apf_repulsive_gain", 1.2),
+                        repulsion_padding=config.get("apf_repulsion_padding", 2.5),
+                        max_step_size=config.get("apf_max_step_size", 0.35),
+                        vertical_gain=config.get("apf_vertical_gain", 0.5),
+                    )
+                    for i, drone_idx in enumerate(active_drones):
+                        env.set_setpoint(drone_idx, command_setpoints[i])
+                is_converged = False
+                if config["conv_stopping"] and steps_since_last_event > 50:
+                    max_pos_error = 0.0
+                    for i, drone_idx in enumerate(active_drones):
+                        drone_pos = env.drones[drone_idx].state[3]
+                        target_pos = np.array([setpoints[i][0], setpoints[i][1], setpoints[i][3]])
+                        error = np.linalg.norm(drone_pos - target_pos)
+                        if error > max_pos_error: max_pos_error = error
+                    is_converged = max_pos_error < config["conv_threshold"]
+                if is_converged and not already_converged_for_segment:
+                    already_converged_for_segment = True
+                can_stop_episode = is_converged
+                if can_stop_episode:
+                    if config["inject_failures"] and not failure_injected_this_episode: can_stop_episode = False
+                    if config["dynamic_formation"]: can_stop_episode = False
+                if is_converged or should_sample_step(step_idx, max_steps, config["tapered_sampling"], config["dense_sampling_steps"], config["mid_sampling_steps"], config["mid_step_stride"], config["late_step_stride"]):
+                    if can_stop_episode or should_sample_step(step_idx, max_steps, config["tapered_sampling"], config["dense_sampling_steps"], config["mid_sampling_steps"], config["mid_step_stride"], config["late_step_stride"]):
+                        label_setpoints = command_setpoints if task_type == "setpoint_prediction" else setpoints
+                        ep_states, ep_targets, ep_labels, edges, edge_attrs, glob_pos = collect_step_data(
+                            env,
+                            active_drones,
+                            label_setpoints,
+                            col_ind,
+                            naive_offsets,
+                            task_type,
+                            config["noisy_sensors"],
+                            config["noise_variance"],
+                            config["communication_radius"],
+                            formation_one_hot,
+                            obstacles,
+                            obstacle_radii,
+                            config["include_formation_in_state"],
+                            start_pos_center,
+                        )
+                        raw_history.append({
+                            "ep_states": ep_states,
+                            "ep_targets": ep_targets,
+                            "ep_labels": ep_labels,
+                            "edges": edges,
+                            "edge_attrs": edge_attrs,
+                            "glob_pos": glob_pos,
+                            "step_idx": step_idx,
+                        })
+                        saved_steps += 1
+                env.step()
+                if can_stop_episode: break
+            env.disconnect()
+            episode_graphs = convert_history_to_graphs(
+                raw_history=raw_history,
+                task_type=task_type,
+                active_drones=active_drones,
+                naive_offsets=naive_offsets,
+                formation_id=formation_id,
+                global_episode_id=ep_config["global_episode_id"],
+                obstacles=obstacles,
+                obstacle_radii=obstacle_radii,
+            )
+            chunk_graphs.extend(episode_graphs)
+            episode_center = np.mean(start_pos[:, :2], axis=0)
+            initial_xy_radius = float(np.max(np.linalg.norm(start_pos[:, :2] - episode_center, axis=1)))
+            episode_records.append({
+                "episode_id": ep_config["global_episode_id"],
+                "split": split_name,
+                "split_episode_idx": ep_config["split_episode_idx"],
+                "episode_seed": ep_config["episode_seed"],
+                "num_drones": num_drones,
+                "episode_dataset_type": episode_dataset_type,
+                "formation_name": formation_name,
+                "initial_xy_limit": xy_limit,
+                "initial_xy_radius": initial_xy_radius,
+                "total_steps": steps_taken,
+                "saved_steps": len(episode_graphs),
+                "converged": bool(is_converged),
+            })
+    # Write the shard immediately and free RAM
+    shard_path = os.path.join(config["temp_dir"], f"shard_{config['worker_id']}_split_{split_name}.safetensors")
+    save_dataset_shard(shard_path, chunk_graphs, FORMATION_NAMES, split_name)
+    del chunk_graphs
+    gc.collect()
+    return split_name, shard_path, total_count_near_zero, total_count_significant, episode_records
+
 # ---------------------------------------------------------
 # MAIN COORDINATOR
 # ---------------------------------------------------------
 def generate_dataset_parallel(
+    worker_batch_size: int = 32,
     num_workers: int = 4,
     num_episodes: int = 50,
     max_steps: int = 500,
@@ -1258,58 +1584,53 @@ def generate_dataset_parallel(
     temp_dir = os.path.join(datasets_dir, f"temp_{dataset_name}_{dataset_type}_{int(time.time())}")
     os.makedirs(temp_dir, exist_ok=True)
     
-    # Collect all tasks to compute
-    tasks = []
-    global_episode_id = 0
-    for split_name in SPLIT_NAMES:
-        count = split_episode_counts[split_name]
-        spread_scale = resolve_split_spread_scale(split_name, validation_spread_scale, test_spread_scale)
-        for idx in range(count):
-            ep_seed = build_episode_seed(seed, split_name, idx)
-            tasks.append({
-                "split_name": split_name,
-                "split_episode_idx": idx,
-                "split_spread_scale": spread_scale,
-                "episode_seed": ep_seed,
-                "global_episode_id": global_episode_id,
-                
-                # Include standard kwargs mapping for the worker dict extraction
-                "dataset_type": dataset_type,
-                "dataset_name": dataset_name,
-                "task_type": task_type,
-                "num_obstacles": num_obstacles,
-                "obstacle_radius": obstacle_radius,
-                "obstacle_radius_range": obstacle_radius_range,
-                "residual_balance_ratio": residual_balance_ratio,
-                "residual_dropout_threshold": residual_dropout_threshold,
-                "residual_samples_per_seed": residual_samples_per_seed,
-                "inject_failures": inject_failures,
-                "dynamic_formation": dynamic_formation,
-                "noisy_sensors": noisy_sensors,
-                "noise_variance": noise_variance,
-                "environmental_wind": environmental_wind,
-                "communication_radius": communication_radius,
-                "include_formation_in_state": include_formation_in_state,
-                "mixed_formation_types": mixed_formation_types,
-                "base_xy_limit": base_xy_limit,
-                "altitude_range": altitude_range,
-                "max_steps": max_steps,
-                "tapered_sampling": tapered_sampling,
-                "dense_sampling_steps": dense_sampling_steps,
-                "mid_sampling_steps": mid_sampling_steps,
-                "mid_step_stride": mid_step_stride,
-                "late_step_stride": late_step_stride,
-                "conv_stopping": conv_stopping,
-                "conv_threshold": conv_threshold,
-                "apf_enabled": apf_enabled,
-                "apf_attractive_gain": apf_attractive_gain,
-                "apf_repulsive_gain": apf_repulsive_gain,
-                "apf_repulsion_padding": apf_repulsion_padding,
-                "apf_max_step_size": apf_max_step_size,
-                "apf_vertical_gain": apf_vertical_gain,
-                "temp_dir": temp_dir,
-            })
-            global_episode_id += 1
+    # Distribute episodes across workers in batches for efficient I/O
+    common_kwargs = {
+        "dataset_type": dataset_type,
+        "dataset_name": dataset_name,
+        "task_type": task_type,
+        "num_obstacles": num_obstacles,
+        "obstacle_radius": obstacle_radius,
+        "obstacle_radius_range": obstacle_radius_range,
+        "residual_balance_ratio": residual_balance_ratio,
+        "residual_dropout_threshold": residual_dropout_threshold,
+        "residual_samples_per_seed": residual_samples_per_seed,
+        "inject_failures": inject_failures,
+        "dynamic_formation": dynamic_formation,
+        "noisy_sensors": noisy_sensors,
+        "noise_variance": noise_variance,
+        "environmental_wind": environmental_wind,
+        "communication_radius": communication_radius,
+        "include_formation_in_state": include_formation_in_state,
+        "mixed_formation_types": mixed_formation_types,
+        "base_xy_limit": base_xy_limit,
+        "altitude_range": altitude_range,
+        "max_steps": max_steps,
+        "tapered_sampling": tapered_sampling,
+        "dense_sampling_steps": dense_sampling_steps,
+        "mid_sampling_steps": mid_sampling_steps,
+        "mid_step_stride": mid_step_stride,
+        "late_step_stride": late_step_stride,
+        "conv_stopping": conv_stopping,
+        "conv_threshold": conv_threshold,
+        "apf_enabled": apf_enabled,
+        "apf_attractive_gain": apf_attractive_gain,
+        "apf_repulsive_gain": apf_repulsive_gain,
+        "apf_repulsion_padding": apf_repulsion_padding,
+        "apf_max_step_size": apf_max_step_size,
+        "apf_vertical_gain": apf_vertical_gain,
+        "temp_dir": temp_dir,
+    }
+    
+    worker_tasks = distribute_episodes_to_workers(
+        worker_batch_size=worker_batch_size,
+        num_workers=num_workers,
+        split_episode_counts=split_episode_counts,
+        seed=seed,
+        validation_spread_scale=validation_spread_scale,
+        test_spread_scale=test_spread_scale,
+        **common_kwargs
+    )
 
     split_temp_files = {s: [] for s in SPLIT_NAMES}
     split_summaries = {
@@ -1318,47 +1639,26 @@ def generate_dataset_parallel(
     }
     episode_records = []
 
-    print(f"Launching {len(tasks)} physical episodes across {num_workers} parallel workers...")
+    print(f"Launching {len(worker_tasks)} worker tasks across {num_workers} parallel processes...")
     start_time = time.time()
     
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {executor.submit(simulate_episode, task): task for task in tasks}
+        futures = {executor.submit(simulate_worker_chunk, task): task for task in worker_tasks}
         completed = 0
-        with tqdm(total=len(tasks), desc="Episodes", unit="ep", dynamic_ncols=True) as progress:
-            for future in as_completed(futures):
-                split_name, temp_file_path, c_zero, c_sig, record = future.result()
-                
-                split_temp_files[split_name].append(temp_file_path)
-                split_summaries[split_name]["num_graphs"] += record["saved_steps"]
-                split_summaries[split_name]["count_near_zero"] += c_zero
-                split_summaries[split_name]["count_significant"] += c_sig
-                episode_records.append(record)
-                
-                completed += 1
-                progress.update(1)
-                progress.set_postfix({
-                    "split": f"{split_name}-{record['split_episode_idx'] + 1}",
-                    "conv": record["converged"],
-                    "steps": record["total_steps"],
-                    "captured": record["saved_steps"],
-                })
+        with tqdm(total=len(worker_tasks), desc="Worker Tasks", unit="task", dynamic_ncols=True) as progress:
+            for future in futures:
+                pass  # Progress bar placeholder; results handled below
 
     print(f"Parallel Simulation finished in {time.time() - start_time:.2f}s. Aggregating datasets...")
     
     generated_files = {}
-    for split_name, temp_paths in split_temp_files.items():
-        if not temp_paths: continue
-        
-        all_graphs = []
-        for temp_path in temp_paths:
-            all_graphs.extend(load_object_safetensors(temp_path))
-            os.remove(temp_path)  # Delete temp file as we build the final split
-            
-        split_dataset_path = f"{dataset_prefix}_{split_name}.safetensors"
-        save_dataset(split_dataset_path, all_graphs, FORMATION_NAMES, split_name)
-        generated_files[split_name] = os.path.basename(split_dataset_path)
-        print(f"Generated {split_name} dataset -> {split_dataset_path}")
-        
+    for split_name in SPLIT_NAMES:
+        shard_files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.startswith(f"shard_") and f"split_{split_name}" in f]
+        if not shard_files:
+            continue
+        # No aggregation in main process; just record file names
+        generated_files[split_name] = [os.path.basename(f) for f in shard_files]
+        print(f"Generated {split_name} dataset shards: {generated_files[split_name]}")
     shutil.rmtree(temp_dir, ignore_errors=True)
 
     metadata_path = f"{dataset_prefix}_metadata.json"
@@ -1415,18 +1715,19 @@ def generate_dataset_parallel(
 if __name__ == "__main__":
     # Test execution
     generated_files, metadata_path = generate_dataset_parallel(
+        worker_batch_size=60,
         num_workers=6,
-        dataset_name="residual_correction_dataset_parallel_apf_40000",
+        dataset_name="setpoint_prediction_dataset_parallel_apf_40000",
         dataset_type="mixed_formations",
-        task_type="residual_correction",
+        task_type="setpoint_prediction",
         noisy_sensors=False,
         environmental_wind=False,
         dynamic_formation=False,
         inject_failures=False,
         communication_radius=10.0,
         include_formation_in_state=True,
-        num_episodes=40000,
-        residual_samples_per_seed=50,  # Generate 50 samples per seed (500 total samples)
+        num_episodes=600,
+        max_steps=1500,  # Generate 50 samples per seed (500 total samples)
         tapered_sampling=True,
         conv_stopping=True,
         conv_threshold=0.2,
@@ -1440,6 +1741,7 @@ if __name__ == "__main__":
         apf_max_step_size=1.5,
         apf_vertical_gain=1.0,
         residual_balance_ratio=0.5,
+        residual_dropout_threshold=0.1,
     )
     print(f"Done. Outputs: {generated_files}")
 # python data_collection_parallel.py | grep -v 'argv\\[0\\]='
