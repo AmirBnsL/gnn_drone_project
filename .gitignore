@@ -17,6 +17,8 @@
 # Ignore generated datasets in data-collection
 /data-collection/datasets/*
 !/data-collection/datasets/.gitkeep
+/gnn/setpoint_prediction3/datasets/*
+!/gnn/setpoint_prediction3/datasets/.gitkeep
 
 /docs/
 /examples/
