@@ -17,9 +17,9 @@
 
 # Ignore generated datasets in data-collection
 /data-collection/datasets/*
-/data-collection/models/*
 !/data-collection/datasets/.gitkeep
 /residual_correction/datasets/*
+/residual_correction/models/*
 !/residual_correction/datasets/.gitkeep
 /docs/
 /examples/
