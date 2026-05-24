@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
-
+from dataset_loader_safetensors import get_dataloaders
 class ZeroResidualRegressor(nn.Module):
     def forward(self, data):
         return torch.zeros(
@@ -14,7 +14,7 @@ class ZeroResidualRegressor(nn.Module):
         )
 
 class MLPResidualRegressor(nn.Module):
-    def __init__(self, in_dim: int = 13, hidden_dim: int = 64, out_dim: int = 3):
+    def __init__(self, in_dim: int = 73, hidden_dim: int = 32, out_dim: int = 3):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -32,7 +32,7 @@ class MLPResidualRegressor(nn.Module):
 class GATResidualRegressor(nn.Module):
     def __init__(
         self,
-        in_dim: int = 13,
+        in_dim: int = 73,
         hidden_dim: int = 32,
         out_dim: int = 3,
         heads: int = 2,
@@ -45,7 +45,7 @@ class GATResidualRegressor(nn.Module):
             out_channels=hidden_dim,
             heads=heads,
             concat=True,
-            edge_dim=3,
+            edge_dim=7,
             dropout=dropout,
         )
 
@@ -54,7 +54,7 @@ class GATResidualRegressor(nn.Module):
             out_channels=hidden_dim,
             heads=1,
             concat=False,
-            edge_dim=3,
+            edge_dim=7,
             dropout=dropout,
         )
 
@@ -83,7 +83,7 @@ class GATResidualRegressor(nn.Module):
 class NNConvResidualRegressor(nn.Module):
     def __init__(
         self,
-        in_dim: int = 13,
+        in_dim: int = 73,
         hidden_dim: int = 32,
         out_dim: int = 3,
     ):
@@ -93,14 +93,14 @@ class NNConvResidualRegressor(nn.Module):
 
         # edge network for conv1: maps edge_attr(3) -> in_dim * hidden_dim
         self.edge_mlp1 = nn.Sequential(
-            nn.Linear(3, 32),
+            nn.Linear(7, 32),
             nn.ReLU(),
             nn.Linear(32, in_dim * hidden_dim),
         )
 
         # edge network for conv2: maps edge_attr(3) -> hidden_dim * hidden_dim
         self.edge_mlp2 = nn.Sequential(
-            nn.Linear(3, 32),
+            nn.Linear(7, 32),
             nn.ReLU(),
             nn.Linear(32, hidden_dim * hidden_dim),
         )
@@ -149,7 +149,7 @@ class NNConvResidualRegressor(nn.Module):
 
         return self.head(h)
 
-def build_model(model_name: str, in_dim: int = 13):
+def build_model(model_name: str, in_dim: int = 73):
     model_name = model_name.lower()
     if model_name == "zero":
         return ZeroResidualRegressor()
@@ -164,15 +164,21 @@ def build_model(model_name: str, in_dim: int = 13):
 
 
 if __name__ == "__main__":
-    from dataset_loader import get_datasets
+    from dataset_loader_safetensors import get_dataloaders
+    from models import build_model
 
-    dataset_dir = "residual_correction/datasets"
-    train_dataset, _, _ = get_datasets(dataset_dir)
-    sample = train_dataset[0]
+    dataset_dir = "datasets"
 
-    for name in ["zero","mlp", "gat","nnconv"]:
+    # ✅ FIX 1: correct unpacking
+    train_loader, val_loader, test_loader = get_dataloaders(dataset_dir)
+
+    # ✅ FIX 2: get batch correctly
+    sample = next(iter(train_loader))
+
+    for name in ["zero", "mlp", "gat", "nnconv"]:
         model = build_model(name, in_dim=sample.x.shape[1])
         out = model(sample)
+
         print(f"\nModel: {name}")
         print("Output shape:", tuple(out.shape))
         print("Target shape:", tuple(sample.target.shape))

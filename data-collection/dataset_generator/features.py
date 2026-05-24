@@ -25,7 +25,7 @@ def compute_lidar_features(
 ):
     num_drones = global_pos.shape[0]
     num_rays = num_azimuth * num_elevation
-
+    EXPECTED_SHAPE = num_rays
     if num_drones == 0:
         return np.zeros((0, num_rays), dtype=np.float32)
 

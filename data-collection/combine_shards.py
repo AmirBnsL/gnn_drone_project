@@ -5,7 +5,7 @@ from tqdm import tqdm
 import torch
 from torch_geometric.data import Data, HeteroData, InMemoryDataset
 from dataset_generator.utils import load_object_safetensors, save_dataset_shard
-
+import shutil
 def extract_graphs_from_payload(payload):
     data = payload["data"]
     slices = payload["slices"]
@@ -100,10 +100,27 @@ def combine_shards(dataset_dir, split_name):
 
     print(f"Total graphs: {len(all_graphs)}. Collating and saving...")
     output_name = f"combined_{split_name}.safetensors"
-    output_path = os.path.join(dataset_dir, output_name)
     
+     # save temporarily in root datasets
+    output_path = os.path.join(dataset_dir, output_name)
+
     save_dataset_shard(output_path, all_graphs, formation_names, split_name)
-    print(f"Successfully saved {split_name} to {output_path}")
+
+    # destination folder inside residual_correction
+    residual_dataset_dir = os.path.join(
+        project_root,
+        "residual_correction",
+        "datasets"
+)
+
+    os.makedirs(residual_dataset_dir, exist_ok=True)
+
+    final_output_path = os.path.join(residual_dataset_dir, output_name)
+
+    # move combined file
+    shutil.move(output_path, final_output_path)
+
+    print(f"Successfully saved {split_name} to {final_output_path}")
 
 if __name__ == "__main__":
     # Resolve the default datasets directory relative to the script location

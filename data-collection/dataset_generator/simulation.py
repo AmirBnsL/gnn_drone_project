@@ -7,7 +7,7 @@ from dataset_generator.utils import sample_episode_initial_conditions, sample_ob
 from dataset_generator.formations import resolve_formation_name
 from dataset_generator.environment import create_aviary, build_setpoints, compute_apf_setpoints
 from dataset_generator.features import compute_lidar_features, build_edges, collect_step_data, convert_history_to_graphs
-
+FORMATION_DIM = len(FORMATION_NAMES)
 def generate_residual_correction_sample(
     rng: np.random.Generator,
     num_drones: int,
@@ -40,11 +40,13 @@ def generate_residual_correction_sample(
     start_pos_center = np.mean(start_pos[:, :2], axis=0)
     
     formation_one_hot = None
-    if formation_id >= 0 and include_formation_in_state:
-        formation_one_hot = np.zeros(len(formation_names), dtype=np.float32)
-        formation_one_hot[formation_id] = 1.0
-    
+    if include_formation_in_state:
+         formation_one_hot = np.zeros(FORMATION_DIM, dtype=np.float32)
+         if formation_id >= 0:
+             formation_one_hot[formation_id] = 1.0
+     
     ep_states, ep_targets, ep_labels = [], [], []
+
     
     for i in range(num_drones):
         local_lin_vel = np.zeros(3, dtype=np.float32)
@@ -55,10 +57,22 @@ def generate_residual_correction_sample(
             local_ang_vel = np.random.normal(0, noise_variance, size=3).astype(np.float32)
         
         obs_features = compute_lidar_features(
-            start_pos[i:i+1], start_orn[i:i+1], obstacles, obstacle_radii, physics_client=None
-        )[0]
-        
-        gnn_input_state = np.concatenate([local_lin_vel, local_ang_vel, obs_features])
+            start_pos[i:i+1],
+            start_orn[i:i+1],
+            obstacles,
+            obstacle_radii,
+            physics_client=None
+        )
+
+        obs_features = np.asarray(obs_features).reshape(-1)
+        gnn_input_state = np.concatenate([local_lin_vel, local_ang_vel, obs_features,formation_one_hot])
+  
+        EXPECTED_DIM = 3 + 3 + obs_features.shape[0] + (len(formation_one_hot) if formation_one_hot is not None else 0)
+
+        assert gnn_input_state.shape[0] == EXPECTED_DIM, (
+            f"Feature mismatch: got {gnn_input_state.shape[0]}, expected {EXPECTED_DIM}"
+        )
+
         if include_formation_in_state and formation_one_hot is not None:
             gnn_input_state = np.concatenate([gnn_input_state, formation_one_hot])
         
@@ -92,7 +106,7 @@ def generate_residual_correction_sample(
         edge_attr = torch.as_tensor(np.asarray(edge_attrs), dtype=torch.float32)
     else:
         edge_index = torch.empty((2, 0), dtype=torch.long)
-        edge_attr = torch.empty((0, 3), dtype=torch.float32)
+        edge_attr = torch.empty((0, 7), dtype=torch.float32)
     
     graph = Data(
         x=x, target=target, y=y, edge_index=edge_index, edge_attr=edge_attr,
@@ -166,11 +180,10 @@ def run_physics_episode(ep_config: dict, config: dict):
     formation_id = FORMATION_TO_ID[formation_name] if formation_name else -1
     start_pos_center = np.mean(start_pos[:, :2], axis=0)
 
-    formation_one_hot = None
-    if formation_id >= 0:
-        formation_one_hot = np.zeros(len(FORMATION_NAMES), dtype=np.float32)
-        formation_one_hot[formation_id] = 1.0
+    formation_one_hot = np.zeros(FORMATION_DIM, dtype=np.float32)
 
+    if formation_id >= 0:
+       formation_one_hot[formation_id] = 1.0
     for i, drone_idx in enumerate(active_drones):
         env.set_setpoint(drone_idx, setpoints[i])
 
