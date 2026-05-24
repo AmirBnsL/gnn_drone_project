@@ -1,33 +1,30 @@
 import torch
-import numpy as np
-
 from inference.feature_extractor import extract_node_features
 from inference.graph_builder import build_graph
 from inference.inference_engine import InferenceEngine
 from models import build_model
 
-# ----------------------------
-# CONFIG
-# ----------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "checkpoints/best_nnconv.pt"
 MODEL_NAME = "nnconv"
 
 # ----------------------------
-# LOAD MODEL (MATCH TRAINING)
+# LOAD MODEL PROPERLY
 # ----------------------------
-sample_in_dim = 12  # MUST match your dataset (adjust if needed)
-model = build_model(MODEL_NAME, in_dim=sample_in_dim)
+
+# IMPORTANT: rebuild EXACT architecture
+model = build_model(MODEL_NAME, in_dim=12)  # MUST match training
 
 model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
 
 engine = InferenceEngine(model, DEVICE)
 
-print("Model loaded successfully")
+print("Model loaded")
 
 # ----------------------------
-# SIMULATION LOOP (EXAMPLE)
+# STEP FUNCTION
 # ----------------------------
+
 def run_step(env, formation_one_hot, noisy_sensors, obstacles, obstacle_radii):
 
     node_features = []
@@ -48,16 +45,10 @@ def run_step(env, formation_one_hot, noisy_sensors, obstacles, obstacle_radii):
         node_features.append(feat)
         positions.append(pos)
 
-    graph = build_graph(node_features, positions, communication_radius=4.0)
+    graph = build_graph(node_features, positions)
 
-    # ----------------------------
-    # INFERENCE (NO TRAINING)
-    # ----------------------------
     corrections = engine.predict(graph).numpy()
 
-    # ----------------------------
-    # APPLY CONTROL
-    # ----------------------------
     for i, drone in enumerate(env.drones):
         drone.apply_position_update(corrections[i])
 
