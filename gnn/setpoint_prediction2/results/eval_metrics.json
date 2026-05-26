@@ -1,0 +1,83 @@
+{
+    "episodes": [
+        {
+            "num_drones": 3,
+            "obs_field": "none",
+            "waypoints": [
+                {
+                    "formation": "a",
+                    "steps_taken": 1954,
+                    "converged": true,
+                    "final_error_m": 0.1387284236612847
+                },
+                {
+                    "formation": "rectangle",
+                    "steps_taken": 1529,
+                    "converged": true,
+                    "final_error_m": 0.18886587577045258
+                }
+            ]
+        },
+        {
+            "num_drones": 6,
+            "obs_field": "none",
+            "waypoints": [
+                {
+                    "formation": "rectangle",
+                    "steps_taken": 2155,
+                    "converged": true,
+                    "final_error_m": 0.09399947363949829
+                },
+                {
+                    "formation": "triangle",
+                    "steps_taken": 3000,
+                    "converged": false,
+                    "final_error_m": 0.44860689577408003
+                }
+            ]
+        },
+        {
+            "num_drones": 6,
+            "obs_field": "corridor",
+            "waypoints": [
+                {
+                    "formation": "rectangle",
+                    "steps_taken": 3000,
+                    "converged": false,
+                    "final_error_m": 1.8277050605463787
+                }
+            ]
+        },
+        {
+            "num_drones": 3,
+            "obs_field": "corridor",
+            "waypoints": [
+                {
+                    "formation": "triangle",
+                    "steps_taken": 1716,
+                    "converged": true,
+                    "final_error_m": 0.1455462108563451
+                },
+                {
+                    "formation": "random_cloud",
+                    "steps_taken": 1795,
+                    "converged": true,
+                    "final_error_m": 0.12994905325313363
+                }
+            ]
+        },
+        {
+            "num_drones": 3,
+            "obs_field": "corridor",
+            "waypoints": [
+                {
+                    "formation": "rectangle",
+                    "steps_taken": 3000,
+                    "converged": false,
+                    "final_error_m": 0.47963688945791877
+                }
+            ]
+        }
+    ],
+    "summary": {}
+}
