@@ -9,6 +9,7 @@
 !/data_collection.md
 !/visualization 
 !/.gitignore
+!/residual_correction/
 
 # Ignore files inside datasets, but keep the folder if there's a .gitkeep or similar
 /datasets/*
@@ -19,6 +20,13 @@
 /data-collection/datasets/*
 !/data-collection/datasets/.gitkeep
 
+
+/residual_correction/datasets/*
+/residual_correction/models/*
+/residual_correction/not_needed_for_new_method/*
+/residual_correction/results_oldGAT/*
+!/residual_correction/datasets/.gitkeep
+
 /docs/
 /examples/
 /docs_source/
@@ -26,3 +34,5 @@
 /PyFlyt/
 /readme_assets/
 readme.md
+datacollection_wrapper.py
+generate_datasets.py
