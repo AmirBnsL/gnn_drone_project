@@ -130,8 +130,12 @@ def build_drone_features(drone, drone_idx, setpoint, assigned_slot_idx, naive_of
         local_lin_vel = precomputed_state["local_lin_vel"]
         local_ang_vel = precomputed_state["local_ang_vel"]
         obs_features = precomputed_state["obs_features"]
-
-    gnn_input_state = np.concatenate([local_lin_vel, local_ang_vel, obs_features])
+    
+    gnn_input_state = np.concatenate([
+        local_lin_vel,
+        local_ang_vel,
+        obs_features,
+    ])
     if include_formation_in_state and formation_one_hot is not None:
         gnn_input_state = np.concatenate([gnn_input_state, formation_one_hot])
 
@@ -252,6 +256,8 @@ def collect_step_data(env, active_drones, setpoints, slot_assignments, naive_off
             physics_client=env._client,
             precomputed_state=precomputed[i],
         )
+        print("FEATURE LEN:", gnn_input_state.shape[0])
+
         episode_states.append(gnn_input_state)
         episode_targets.append(gnn_input_target)
         episode_labels.append(motor_pwm_labels)

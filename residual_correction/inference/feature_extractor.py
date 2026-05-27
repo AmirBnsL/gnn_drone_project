@@ -1,6 +1,6 @@
 import numpy as np
 import pybullet as p
-
+from dataset_generator.features import compute_lidar_features
 def extract_node_features(
     drone,
     obstacles,
@@ -26,7 +26,13 @@ def extract_node_features(
         local_ang_vel += np.random.normal(0, noise, 3)
 
     # lidar fallback (simple version for inference safety)
-    obs_features = np.zeros(8, dtype=np.float32)
+    obs_features = compute_lidar_features(
+        global_pos[None, :],
+        global_euler[None, :],
+        obstacles,
+        obstacle_radii,
+        physics_client=physics_client,
+    )[0]
 
     feat = np.concatenate([
         local_lin_vel,
