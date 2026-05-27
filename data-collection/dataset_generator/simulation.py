@@ -9,8 +9,6 @@ from dataset_generator.environment import create_aviary, build_setpoints, comput
 from dataset_generator.features import compute_lidar_features, build_edges, collect_step_data, convert_history_to_graphs
 FORMATION_DIM = len(FORMATION_NAMES)
 # temporary stub during dataset generation
-def run_step(*args, **kwargs):
-    raise RuntimeError("run_step disabled during dataset generation")
 def generate_residual_correction_sample(
     rng: np.random.Generator,
     num_drones: int,
