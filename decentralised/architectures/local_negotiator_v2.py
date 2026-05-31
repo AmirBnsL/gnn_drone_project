@@ -30,9 +30,8 @@ EDGE_FEAT_DIM = 2
 HIDDEN_DIM = 64
 NUM_GAT_HEADS = 4
 NUM_GNN_LAYERS = 3
-COMM_RADIUS = 4.5  # raised from 3.0 — at 3.0, ~6% of drones had zero neighbours in a
-# 10m arena with N∈[8,20], making conflict resolution via gossip impossible for them.
-SLOT_VISIBILITY_RADIUS = 5.0
+COMM_RADIUS = 6.0
+SLOT_VISIBILITY_RADIUS = 8.0
 MAX_GOSSIP_ROUNDS = 8
 GOSSIP_FLOOD_STEPS = 5
 MAX_CONSENSUS_ROUNDS = 12
@@ -369,23 +368,38 @@ def sparse_cross_entropy(
     targets: torch.Tensor,
     candidate_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """CE per drone over visible slots only (stable; no -inf rows)."""
+    """CE per drone over visible slots only — vectorised batched version.
+
+    Replaces the original per-drone loop (N separate F.cross_entropy calls)
+    with a single batched call. Pads each drone's visible logits to max_vis
+    length and remaps target slot indices to local (padded) positions.
+    """
+    device = dense.device
+    mask = candidate_mask.to(device).bool()
     n = targets.size(0)
-    losses = []
+    max_vis = int(mask.sum(dim=1).max().item())
+    if max_vis == 0:
+        return dense.sum() * 0.0
+
+    padded = torch.full((n, max_vis), -1e9, device=device)
+    remapped_targets = torch.full((n,), -1, dtype=torch.long, device=device)
+
     for i in range(n):
-        vis = candidate_mask[i].nonzero(as_tuple=True)[0]
+        vis = mask[i].nonzero(as_tuple=True)[0]
         if vis.numel() == 0:
             continue
-        row = dense[i, vis]
-        tgt_slot = targets[i].item()
-        local_idx = (vis == tgt_slot).nonzero(as_tuple=True)[0]
-        if local_idx.numel() == 0:
-            continue
-        tgt_class = torch.tensor([local_idx[0].item()], device=row.device, dtype=torch.long)
-        losses.append(F.cross_entropy(row.unsqueeze(0), tgt_class))
-    if not losses:
+        padded[i, :vis.numel()] = dense[i, vis]
+        tgt = int(targets[i].item())
+        local = (vis == tgt).nonzero(as_tuple=True)[0]
+        if local.numel() > 0:
+            remapped_targets[i] = int(local[0].item())
+
+    valid = remapped_targets >= 0
+    if not bool(valid.any()):
         return dense.sum() * 0.0
-    return torch.stack(losses).mean()
+    return F.cross_entropy(
+        padded[valid], remapped_targets[valid], ignore_index=-1
+    )
 
 
 def sparse_negotiator_loss(

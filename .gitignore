@@ -14,7 +14,7 @@
 /datasets/*
 !/datasets/.gitkeep
 !/gnn/.gitkeep
-
+/decentralised/models/*
 # Ignore generated datasets in data-collection
 /data-collection/datasets/*
 !/data-collection/datasets/.gitkeep
