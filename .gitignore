@@ -6,14 +6,15 @@
 !/datasets/
 !/gnn/
 !/data_collection.md
-!/visualization 
+!/visualization
 !/.gitignore
-
+!/data
+*.pyc
 # Ignore files inside datasets, but keep the folder if there's a .gitkeep or similar
 /datasets/*
 !/datasets/.gitkeep
 !/gnn/.gitkeep
-
+!/pyproject.toml
 # Ignore generated datasets in data-collection
 /data-collection/datasets/*
 !/data-collection/datasets/.gitkeep
@@ -25,3 +26,6 @@
 /PyFlyt/
 /readme_assets/
 readme.md
+data-collection/__pycache__/
+data-collection/dataset_generator/__pycache__/
+visualization/__pycache__/

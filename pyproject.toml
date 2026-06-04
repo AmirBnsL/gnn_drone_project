@@ -1,0 +1,19 @@
+[project]
+name = "gnn-drone-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "plotly>=6.7.0",
+    "pybullet>=3.2.7",
+    "pyflyt>=0.21.0",
+    "safetensors>=0.7.0",
+    "scipy>=1.17.1",
+    "torch>=2.12.0",
+    "torch-geometric>=2.7.0",
+    "tqdm>=4.67.3",
+]
