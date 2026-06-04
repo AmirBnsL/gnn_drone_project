@@ -49,8 +49,8 @@
 /tests/
 /PyFlyt/
 /readme_assets/
-readme.md
+
 data-collection/__pycache__/
 data-collection/dataset_generator/__pycache__/
 visualization/__pycache__/
-README.md
+!README.md
