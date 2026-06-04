@@ -9,8 +9,15 @@
 !/data_collection.md
 !/visualization
 !/.gitignore
+<<<<<<< HEAD
 !/data
 *.pyc
+=======
+!/residual_correction/
+!/merged_work/
+!/Website/
+/Website/Theoritical/frontend/node_modules
+>>>>>>> origin/DeploimentsAndVisualisation
 # Ignore files inside datasets, but keep the folder if there's a .gitkeep or similar
 /datasets/*
 !/datasets/.gitkeep
@@ -26,6 +33,16 @@
 /gnn/setpoint_prediction3/datasets/*
 !/gnn/setpoint_prediction3/datasets/.gitkeep
 
+<<<<<<< HEAD
+=======
+
+/residual_correction/datasets/*
+/residual_correction/models/*
+/residual_correction/not_needed_for_new_method/*
+/residual_correction/results_oldGAT/*
+!/residual_correction/datasets/.gitkeep
+*.pyc
+>>>>>>> origin/DeploimentsAndVisualisation
 /docs/
 /examples/
 /docs_source/
