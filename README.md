@@ -1,4 +1,4 @@
-# GNN Drone Project
+# Pattern Emergence in Drone Swarms Using Graph-Based AI Models
 
 ## Overview
 This repository contains a complete pipeline for generating synthetic drone formation datasets, visualising them, training Graph Neural Network (GNN) models for several tasks, and deploying the trained models via a web interface.
