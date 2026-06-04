@@ -5,6 +5,7 @@
 !/data-collection/
 !/datasets/
 !/gnn/
+!/decentralised/
 !/data_collection.md
 !/visualization
 !/.gitignore
@@ -14,7 +15,11 @@
 /datasets/*
 !/datasets/.gitkeep
 !/gnn/.gitkeep
+<<<<<<< HEAD
 !/pyproject.toml
+=======
+/decentralised/models/*
+>>>>>>> origin/assignment
 # Ignore generated datasets in data-collection
 /data-collection/datasets/*
 !/data-collection/datasets/.gitkeep
