@@ -10,7 +10,9 @@
 !/visualization 
 !/.gitignore
 !/residual_correction/
-
+!/merged_work/
+!/Website/
+/Website/Theoritical/frontend/node_modules
 # Ignore files inside datasets, but keep the folder if there's a .gitkeep or similar
 /datasets/*
 !/datasets/.gitkeep
@@ -28,7 +30,7 @@
 /residual_correction/not_needed_for_new_method/*
 /residual_correction/results_oldGAT/*
 !/residual_correction/datasets/.gitkeep
-
+*.pyc
 /docs/
 /examples/
 /docs_source/
