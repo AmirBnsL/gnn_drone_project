@@ -7,6 +7,7 @@ from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 import numpy as np
 import torch
+from concurrent.futures import as_completed
 
 from dataset_generator.constants import FORMATION_NAMES, SPLIT_NAMES, TASK_TYPES
 from dataset_generator.utils import compute_split_episode_counts, resolve_split_spread_scale, save_dataset_shard, write_dataset_metadata
@@ -280,12 +281,43 @@ def generate_dataset_parallel(
     print(f"Launching {len(worker_tasks)} worker tasks across {num_workers} parallel processes...")
     start_time = time.time()
     
+  
+
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {executor.submit(simulate_worker_chunk, task): task for task in worker_tasks}
-        with tqdm(total=len(worker_tasks), desc="Worker Tasks", unit="task", dynamic_ncols=True) as progress:
-            for future in futures:
-                # Need as_completed actually if we want to iterate over them safely, but this works to just await
-                pass
+        futures = {
+            executor.submit(simulate_worker_chunk, task): task
+            for task in worker_tasks
+        }
+
+        with tqdm(total=len(worker_tasks),
+                desc="Worker Tasks",
+                unit="task",
+                dynamic_ncols=True) as progress:
+
+            for future in as_completed(futures):
+
+                try:
+                    (
+                        split_name,
+                        shard_files,
+                        count_near_zero,
+                        count_significant,
+                        worker_episode_records,
+                    ) = future.result()
+
+                    split_summaries[split_name]["num_graphs"] += (
+                        count_near_zero + count_significant
+                    )
+
+                    split_summaries[split_name]["count_near_zero"] += count_near_zero
+                    split_summaries[split_name]["count_significant"] += count_significant
+
+                    episode_records.extend(worker_episode_records)
+
+                except Exception as e:
+                    print(f"\nWorker failed with error:\n{e}\n")
+
+                progress.update(1)
 
     print(f"Parallel Simulation finished in {time.time() - start_time:.2f}s. Aggregating datasets...")
     

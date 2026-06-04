@@ -1,3 +1,4 @@
-from dataset_generator.parallel import generate_dataset_parallel
+# dataset_generator/__init__.py
+# DO NOT auto-import heavy modules here
 
-__all__ = ["generate_dataset_parallel"]
+__all__ = []
